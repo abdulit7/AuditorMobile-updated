@@ -40,6 +40,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import pk.auditgrid.audittest.model.AuditPreset
 import pk.auditgrid.audittest.model.PlanLink
+import pk.auditgrid.audittest.model.linkedCityIds
+import pk.auditgrid.audittest.model.linkedTerritoryIds
 import pk.auditgrid.audittest.ui.AppUiState
 import pk.auditgrid.audittest.ui.AuditGridViewModel
 import pk.auditgrid.audittest.ui.MobileSection
@@ -265,19 +267,22 @@ fun AuditorMobileShell(
     viewModel: AuditGridViewModel
 ) {
     val session = uiState.session ?: return
-    val activeAuditor = uiState.users.find { it.id == session.user.id } ?: session.user
+    val activeAuditor = uiState.users.find {
+        it.id == session.user.id ||
+            (it.username.isNotBlank() && it.username.equals(session.user.username, ignoreCase = true))
+    } ?: session.user
     val activeRole = uiState.roles.find { it.id == activeAuditor.roleId } ?: session.role
 
-    val assignedTerritoryIdsSet = remember(activeAuditor.id, activeAuditor.assignedTerritoryIds) {
-        activeAuditor.assignedTerritoryIds.toSet()
+    val assignedTerritoryIdsSet = remember(activeAuditor, uiState.territories, session.isGlobal) {
+        activeAuditor.linkedTerritoryIds(uiState.territories, session.isGlobal)
     }
     val assignedTerritories = remember(uiState.territories, assignedTerritoryIdsSet) {
         uiState.territories.filter {
             assignedTerritoryIdsSet.contains(it.id) && it.status == "Active"
         }
     }
-    val assignedCityIdsSet = remember(assignedTerritories) {
-        assignedTerritories.map { it.cityId }.toSet()
+    val assignedCityIdsSet = remember(activeAuditor, uiState.cities, uiState.territories, session.isGlobal) {
+        activeAuditor.linkedCityIds(uiState.cities, uiState.territories, session.isGlobal)
     }
     val assignedCities = remember(uiState.cities, assignedCityIdsSet) {
         uiState.cities.filter {

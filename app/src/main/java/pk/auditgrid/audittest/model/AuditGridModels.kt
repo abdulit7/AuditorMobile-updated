@@ -17,13 +17,15 @@ data class Territory(
     val code: String,
     val name: String,
     val cityId: String,
+    val cityName: String = "",
     val distributorName: String,
     val distributorCode: String,
     val assignedAuditorIds: List<String>,
     val lat: Double,
     val lng: Double,
     val status: String,
-    val updatedAt: String = ""
+    val updatedAt: String = "",
+    val version: Int = 0
 )
 
 data class LocationItem(
@@ -31,8 +33,13 @@ data class LocationItem(
     val code: String,
     val name: String,
     val territoryId: String,
+    val territoryName: String = "",
     val cityId: String,
-    val areaClassification: String,
+    val cityName: String = "",
+    val areaClassification: String = "Urban Commercial",
+    val subLocationsCount: Int = 0,
+    val shopsCount: Int = 0,
+    val gpsStatus: String = "GPS Verified",
     val lat: Double,
     val lng: Double,
     val status: String
@@ -43,10 +50,14 @@ data class SubLocation(
     val code: String,
     val name: String,
     val locationId: String,
+    val locationName: String = "",
     val territoryId: String,
+    val territoryName: String = "",
     val cityId: String,
-    val marketType: String,
-    val postalCode: String,
+    val cityName: String = "",
+    val marketType: String = "Main Bazaar",
+    val postalCode: String = "",
+    val shopsCount: Int = 0,
     val lat: Double,
     val lng: Double,
     val status: String
@@ -59,18 +70,25 @@ data class Shop(
     val ownerName: String,
     val phone: String,
     val subLocationId: String,
+    val subLocationName: String = "",
     val locationId: String,
+    val locationName: String = "",
     val territoryId: String,
+    val territoryName: String = "",
     val cityId: String,
-    val shopCategory: String,
+    val cityName: String = "",
+    val shopCategory: String = "General Store",
+    val shopType: String = "General Store",
     val lat: Double,
     val lng: Double,
-    val allowedRadiusMeters: Int,
-    val gpsStatus: String,
+    val allowedRadiusMeters: Int = 150,
+    val gpsStatus: String = "GPS Verified",
     val gpsAccuracyMeters: Int? = null,
-    val status: String,
+    val status: String = "Active",
     val lastVerifiedAt: String = "",
-    val addressLine: String
+    val lastAudit: String = "Never",
+    val addressLine: String = "",
+    val address: String = ""
 )
 
 data class ProductGroup(
@@ -144,6 +162,7 @@ data class Distributor(
     val productStatuses: Map<String, String>,
     val lat: Double,
     val lng: Double,
+    val gpsStatus: String = "GPS Verified",
     val status: String,
     val createdAt: String = ""
 )
@@ -157,6 +176,7 @@ data class AuditFormDefinition(
     val kind: String = "builtin",
     val target: String = "distributor",
     val description: String = "",
+    val fieldsCount: Int = 0,
     val requiresBackgroundGPS: Boolean = true,
     val allowMultipleEntriesPerProduct: Boolean = true,
     val allowPhotoCapture: Boolean = true,
@@ -472,3 +492,59 @@ data class AuditPreset(
     val targetId: String? = null,
     val shopIds: List<String> = emptyList()
 )
+
+fun AppUser.linkedTerritoryIds(
+    allTerritories: List<Territory>,
+    isGlobal: Boolean = false
+): Set<String> {
+    val direct = LinkedHashSet<String>()
+    direct.addAll(assignedTerritoryIds.filter { it.isNotBlank() })
+    for (t in allTerritories) {
+        if (t.assignedAuditorIds.contains(id)) {
+            direct.add(t.id)
+        }
+    }
+    if (direct.isNotEmpty()) return direct
+    if (assignedCityIds.isNotEmpty()) {
+        val citySet = assignedCityIds.toSet()
+        val fromCities = allTerritories.filter { citySet.contains(it.cityId) }.map { it.id }.toSet()
+        if (fromCities.isNotEmpty()) return fromCities
+    }
+    if (isGlobal) {
+        return allTerritories.map { it.id }.toSet()
+    }
+    return direct
+}
+
+fun AppUser.linkedCityIds(
+    allCities: List<City>,
+    allTerritories: List<Territory>,
+    isGlobal: Boolean = false
+): Set<String> {
+    val terIds = linkedTerritoryIds(allTerritories, isGlobal)
+    val combined = LinkedHashSet<String>()
+    combined.addAll(assignedCityIds.filter { it.isNotBlank() })
+    for (t in allTerritories) {
+        if (terIds.contains(t.id) && t.cityId.isNotBlank()) {
+            combined.add(t.cityId)
+        }
+    }
+    if (combined.isNotEmpty()) return combined
+    if (isGlobal) {
+        return allCities.map { it.id }.toSet()
+    }
+    return combined
+}
+
+fun AppUser.withNormalizedLinks(
+    allCities: List<City>,
+    allTerritories: List<Territory>,
+    isGlobal: Boolean = false
+): AppUser {
+    val resolvedTerritories = linkedTerritoryIds(allTerritories, isGlobal).toList()
+    val resolvedCities = linkedCityIds(allCities, allTerritories, isGlobal).toList()
+    return copy(
+        assignedTerritoryIds = resolvedTerritories,
+        assignedCityIds = resolvedCities
+    )
+}

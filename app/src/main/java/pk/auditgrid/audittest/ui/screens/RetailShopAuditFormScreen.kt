@@ -82,20 +82,23 @@ fun RetailShopAuditFormScreen(
     val storageKey = "auditgrid_retail_shop_audit_draft_v1_${activeAuditor.id}"
     val fh = remember(formConfigs) { makeFormHelper(formConfigs[RETAIL_FORM_ID]) }
 
-    val assignedCities = remember(cities, activeAuditor.id) {
-        cities.filter { activeAuditor.assignedCityIds.contains(it.id) }
+    val assignedTerritoryIdsSet = remember(territories, activeAuditor) {
+        activeAuditor.linkedTerritoryIds(territories)
     }
-    val assignedTerritories = remember(territories, activeAuditor.id) {
-        territories.filter { activeAuditor.assignedTerritoryIds.contains(it.id) }
+    val assignedTerritories = remember(territories, assignedTerritoryIdsSet) {
+        territories.filter { assignedTerritoryIdsSet.contains(it.id) && it.status == "Active" }
     }
-    val assignedTerritoryIdsSet = remember(assignedTerritories) {
-        assignedTerritories.map { it.id }.toSet()
+    val assignedCityIdsSet = remember(cities, territories, activeAuditor) {
+        activeAuditor.linkedCityIds(cities, territories)
+    }
+    val assignedCities = remember(cities, assignedCityIdsSet) {
+        cities.filter { assignedCityIdsSet.contains(it.id) && it.status == "Active" }
     }
     val assignedLocations = remember(locations, assignedTerritoryIdsSet) {
-        locations.filter { assignedTerritoryIdsSet.contains(it.territoryId) }
+        locations.filter { assignedTerritoryIdsSet.contains(it.territoryId) && it.status == "Active" }
     }
     val assignedSubLocations = remember(subLocations, assignedTerritoryIdsSet) {
-        subLocations.filter { assignedTerritoryIdsSet.contains(it.territoryId) }
+        subLocations.filter { assignedTerritoryIdsSet.contains(it.territoryId) && it.status != "Inactive" }
     }
 
     var selectedCityId by remember { mutableStateOf("") }
@@ -626,7 +629,14 @@ fun RetailShopAuditFormScreen(
                                             Row(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
-                                                    .clickable { activePopupShop = shop }
+                                                    .clickable {
+                                                        if (!isMobileLocationReadyForAudit(context)) {
+                                                            onToast("Mobile location is OFF. Turn on mobile location to start an audit.")
+                                                            onBackToForms?.invoke()
+                                                        } else {
+                                                            activePopupShop = shop
+                                                        }
+                                                    }
                                                     .padding(horizontal = 10.dp, vertical = 10.dp),
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
@@ -701,6 +711,11 @@ fun RetailShopAuditFormScreen(
                             if (doneShopsCount == 0) {
                                 Button(
                                     onClick = {
+                                        if (!isMobileLocationReadyForAudit(context)) {
+                                            onToast("Mobile location is OFF. Turn on mobile location to start an audit.")
+                                            onBackToForms?.invoke()
+                                            return@Button
+                                        }
                                         val firstPending = subLocationShops.find {
                                             currentSubLocationAuditsMap[it.id]?.auditStatus != "Done"
                                         } ?: subLocationShops.firstOrNull()
@@ -721,6 +736,10 @@ fun RetailShopAuditFormScreen(
                                 Button(
                                     onClick = {
                                         if (submitting) return@Button
+                                        if (!isMobileLocationReadyForAudit(context)) {
+                                            onToast("Mobile location is OFF. Turn on mobile location to submit this audit.")
+                                            return@Button
+                                        }
                                         val auditedItems = subLocationShops.mapNotNull { sh ->
                                             currentSubLocationAuditsMap[sh.id]?.takeIf { it.auditStatus == "Done" }
                                         }

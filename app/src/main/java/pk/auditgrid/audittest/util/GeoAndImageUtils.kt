@@ -1,7 +1,10 @@
 package pk.auditgrid.audittest.util
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -9,14 +12,24 @@ import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.net.Uri
+import android.os.Build
 import android.os.CancellationSignal
 import android.os.Looper
+import android.provider.Settings
 import android.util.Base64
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -77,6 +90,103 @@ fun hasLocationPermission(context: Context): Boolean {
     return fine || coarse
 }
 
+data class MobileLocationStatus(
+    val hasPermission: Boolean,
+    val isServiceEnabled: Boolean
+) {
+    val isReady: Boolean
+        get() = hasPermission && isServiceEnabled
+}
+
+fun isDeviceLocationEnabled(context: Context): Boolean {
+    val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return false
+    val masterEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        runCatching { lm.isLocationEnabled }.getOrDefault(false)
+    } else {
+        true
+    }
+    val gpsEnabled = runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)
+    val netEnabled = runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false)
+    return masterEnabled && (gpsEnabled || netEnabled)
+}
+
+fun isMobileLocationReadyForAudit(context: Context): Boolean =
+    hasLocationPermission(context) && isDeviceLocationEnabled(context)
+
+fun getMobileLocationStatus(context: Context): MobileLocationStatus =
+    MobileLocationStatus(
+        hasPermission = hasLocationPermission(context),
+        isServiceEnabled = isDeviceLocationEnabled(context)
+    )
+
+fun openDeviceLocationSettings(context: Context) {
+    runCatching {
+        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+}
+
+fun openAppLocationPermissionSettings(context: Context) {
+    runCatching {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.fromParts("package", context.packageName, null)
+        ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+}
+
+@Composable
+fun rememberMobileLocationStatus(context: Context): State<MobileLocationStatus> {
+    val state = remember { mutableStateOf(getMobileLocationStatus(context)) }
+
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                val updated = getMobileLocationStatus(context)
+                if (!updated.isReady) {
+                    WarmLocationManager.clearPosition()
+                }
+                state.value = updated
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(LocationManager.PROVIDERS_CHANGED_ACTION)
+            addAction(LocationManager.MODE_CHANGED_ACTION)
+        }
+        runCatching {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }
+        onDispose {
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+    }
+
+    LaunchedEffect(context) {
+        while (isActive) {
+            val updated = getMobileLocationStatus(context)
+            if (!updated.isReady) {
+                WarmLocationManager.clearPosition()
+            }
+            if (state.value != updated) {
+                state.value = updated
+            }
+            delay(800L)
+        }
+    }
+
+    return state
+}
+
 /**
  * Background Location Pre-Fetcher (WarmLocationManager):
  * Starts listening to both GPS_PROVIDER and NETWORK_PROVIDER in parallel as soon as an auditor
@@ -96,6 +206,11 @@ object WarmLocationManager {
     private var activeListener: LocationListener? = null
     private var activeRefCount: Int = 0
 
+    fun clearPosition() {
+        _latestPosition.value = null
+        lastFixWallClockMs = 0L
+    }
+
     fun recordFix(pos: DevicePosition, wallClockMs: Long = System.currentTimeMillis()) {
         val cur = _latestPosition.value
         val ageMs = wallClockMs - lastFixWallClockMs
@@ -114,7 +229,10 @@ object WarmLocationManager {
     @SuppressLint("MissingPermission")
     @Synchronized
     fun startWarming(context: Context) {
-        if (!hasLocationPermission(context)) return
+        if (!isMobileLocationReadyForAudit(context)) {
+            clearPosition()
+            return
+        }
         val appCtx = context.applicationContext
         val lm = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
 
@@ -175,7 +293,16 @@ object WarmLocationManager {
 @SuppressLint("MissingPermission")
 suspend fun getDevicePosition(context: Context, timeoutMs: Long = 8000L): DevicePosition {
     if (!hasLocationPermission(context)) {
+        WarmLocationManager.clearPosition()
         throw GpsException(GpsErrorKind.DENIED)
+    }
+
+    val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        ?: throw GpsException(GpsErrorKind.UNSUPPORTED)
+
+    if (!isDeviceLocationEnabled(context)) {
+        WarmLocationManager.clearPosition()
+        throw GpsException(GpsErrorKind.UNAVAILABLE)
     }
 
     // 1. Instant 0ms return if WarmLocationManager already pre-fetched a fresh fix while the form was open!
@@ -183,12 +310,10 @@ suspend fun getDevicePosition(context: Context, timeoutMs: Long = 8000L): Device
         return warm
     }
 
-    val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-        ?: throw GpsException(GpsErrorKind.UNSUPPORTED)
-
     val gpsEnabled = runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)
     val netEnabled = runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false)
     if (!gpsEnabled && !netEnabled) {
+        WarmLocationManager.clearPosition()
         throw GpsException(GpsErrorKind.UNAVAILABLE)
     }
 

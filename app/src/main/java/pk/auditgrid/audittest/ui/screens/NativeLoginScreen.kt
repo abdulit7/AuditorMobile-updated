@@ -53,22 +53,17 @@ fun NativeLoginScreen(
             return
         }
         val base = AuditGridApiClient.normalizeBase(server)
+        if (!Regex("^https?://.+", RegexOption.IGNORE_CASE).matches(base)) {
+            error = "Please enter a valid server address (e.g. http://192.168.1.20:3001)."
+            return
+        }
 
         busy = true
         scope.launch {
             try {
-                if (Regex("^https?://.+", RegexOption.IGNORE_CASE).matches(base)) {
-                    apiClient.setApiBase(base)
-                    val reachable = apiClient.checkServer(base)
-                    if (reachable) {
-                        val session = apiClient.login(username.trim(), password)
-                        onSignedIn(session)
-                        return@launch
-                    }
-                }
-                // When running in cloud emulator preview or offline from local LAN server, sign in immediately
-                val fallbackSession = apiClient.signInLocalSession(username.trim())
-                onSignedIn(fallbackSession)
+                apiClient.setApiBase(base)
+                val session = apiClient.login(username.trim(), password)
+                onSignedIn(session)
             } catch (err: Exception) {
                 error = if (err is ApiError) err.message else "Could not sign in."
             } finally {

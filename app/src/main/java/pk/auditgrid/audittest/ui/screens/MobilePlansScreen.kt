@@ -3,6 +3,8 @@ package pk.auditgrid.audittest.ui.screens
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -373,7 +375,7 @@ private fun PlanBuilderView(
     val submitKey = remember { newSubmitKey() }
     val scope = rememberCoroutineScope()
 
-    val terrs = remember(activeAuditor.id) { activeAuditor.assignedTerritoryIds.toSet() }
+    val terrs = remember(activeAuditor) { activeAuditor.assignedTerritoryIds.toSet() }
     val activeForms = remember(auditForms) { auditForms.filter { it.status == "Active" } }
 
     fun formTarget(f: AuditFormDefinition): String =
@@ -791,10 +793,97 @@ private fun PlanDetailView(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val locationStatus by rememberMobileLocationStatus(context)
     var busy by remember { mutableStateOf(false) }
     var skippingItemId by remember { mutableStateOf<String?>(null) }
     var skipReason by remember { mutableStateOf("") }
     var showMap by remember { mutableStateOf(false) }
+    var pendingItemToOpen by remember { mutableStateOf<String?>(null) }
+    var pendingStartPlan by remember { mutableStateOf(false) }
+    var showLocationDialog by remember { mutableStateOf(false) }
+
+    val planPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val granted = grants[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            grants[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (granted && isDeviceLocationEnabled(context)) {
+            showLocationDialog = false
+            pendingItemToOpen?.let { targetItem ->
+                pendingItemToOpen = null
+                onOpenItem(targetItem)
+            }
+        } else {
+            showLocationDialog = true
+            onToast("Mobile location must be ON to start an audit.")
+        }
+    }
+
+    LaunchedEffect(locationStatus.isReady) {
+        if (locationStatus.isReady && showLocationDialog) {
+            showLocationDialog = false
+            val targetItem = pendingItemToOpen
+            if (targetItem != null) {
+                pendingItemToOpen = null
+                onOpenItem(targetItem)
+            } else if (pendingStartPlan) {
+                pendingStartPlan = false
+                busy = true
+                try {
+                    onChanged(apiClient.startPlan(plan.id))
+                } catch (e: Exception) {
+                    onToast(e.message ?: "Could not start plan.")
+                } finally {
+                    busy = false
+                }
+            }
+        }
+    }
+
+    if (showLocationDialog) {
+        MobileLocationRequiredDialog(
+            status = locationStatus,
+            onTurnOnLocation = { openDeviceLocationSettings(context) },
+            onGrantPermission = {
+                planPermissionLauncher.launch(
+                    arrayOf(
+                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                        android.Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            },
+            onCheckAgain = {
+                val fresh = getMobileLocationStatus(context)
+                if (fresh.isReady) {
+                    showLocationDialog = false
+                    val targetItem = pendingItemToOpen
+                    if (targetItem != null) {
+                        pendingItemToOpen = null
+                        onOpenItem(targetItem)
+                    } else if (pendingStartPlan) {
+                        pendingStartPlan = false
+                        busy = true
+                        scope.launch {
+                            try {
+                                onChanged(apiClient.startPlan(plan.id))
+                            } catch (e: Exception) {
+                                onToast(e.message ?: "Could not start plan.")
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    }
+                } else {
+                    onToast("Mobile location is still OFF. Please turn on mobile location first.")
+                }
+            },
+            onDismiss = {
+                showLocationDialog = false
+                pendingItemToOpen = null
+                pendingStartPlan = false
+            }
+        )
+    }
 
     val done = plan.items.count { it.status != "Pending" }
     val progress = if (plan.items.isNotEmpty()) done.toFloat() / plan.items.size else 0f
@@ -822,6 +911,19 @@ private fun PlanDetailView(
                 )
             }
         }
+
+        MobileLocationOffBanner(
+            status = locationStatus,
+            onTurnOnLocation = { openDeviceLocationSettings(context) },
+            onGrantPermission = {
+                planPermissionLauncher.launch(
+                    arrayOf(
+                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                        android.Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            }
+        )
 
         Surface(
             color = AgCardWhite,
@@ -853,6 +955,12 @@ private fun PlanDetailView(
                 if (plan.status == "Planned") {
                     Button(
                         onClick = {
+                            if (!isMobileLocationReadyForAudit(context)) {
+                                pendingStartPlan = true
+                                showLocationDialog = true
+                                onToast("Mobile location is OFF. Turn on mobile location to start an audit plan.")
+                                return@Button
+                            }
                             busy = true
                             scope.launch {
                                 try {
@@ -1048,7 +1156,15 @@ private fun PlanDetailView(
                                         }
                                     }
                                     Button(
-                                        onClick = { onOpenItem(item.id) },
+                                        onClick = {
+                                            if (!isMobileLocationReadyForAudit(context)) {
+                                                pendingItemToOpen = item.id
+                                                showLocationDialog = true
+                                                onToast("Mobile location is OFF. Turn on mobile location to start an audit.")
+                                            } else {
+                                                onOpenItem(item.id)
+                                            }
+                                        },
                                         shape = RoundedCornerShape(12.dp),
                                         colors = ButtonDefaults.buttonColors(containerColor = AgPrimary),
                                         modifier = Modifier

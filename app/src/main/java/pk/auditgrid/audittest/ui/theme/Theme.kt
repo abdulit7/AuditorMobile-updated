@@ -6,20 +6,31 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.LocationOff
 import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.lightColorScheme
@@ -30,10 +41,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import pk.auditgrid.audittest.util.MobileLocationStatus
 import pk.auditgrid.audittest.util.dataUrlToBytes
 import java.text.NumberFormat
 import java.util.Locale
@@ -231,6 +246,199 @@ fun DataUrlImage(
                 fontSize = 10.sp,
                 color = AgMutedText
             )
+        }
+    }
+}
+
+@Composable
+fun MobileLocationOffBanner(
+    status: MobileLocationStatus,
+    onTurnOnLocation: () -> Unit,
+    onGrantPermission: () -> Unit
+) {
+    if (status.isReady) return
+
+    val isPermMissing = !status.hasPermission
+    Surface(
+        color = AgDestructiveBg,
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.5.dp, AgDestructive),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("mobile_location_off_banner")
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(AgDestructive, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOff,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(
+                    text = if (isPermMissing) "Location Permission is OFF" else "Mobile Location is OFF",
+                    color = AgDestructiveDark,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Text(
+                    text = "Mobile location must be turned ON to open or start any audit form.",
+                    color = AgDestructiveDark,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+            }
+            Button(
+                onClick = if (isPermMissing) onGrantPermission else onTurnOnLocation,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = AgDestructive),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                modifier = Modifier
+                    .heightIn(min = 38.dp)
+                    .testTag("turn_on_location_banner_button")
+            ) {
+                Text(
+                    text = if (isPermMissing) "Allow" else "Turn On",
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun MobileLocationRequiredDialog(
+    status: MobileLocationStatus,
+    onTurnOnLocation: () -> Unit,
+    onGrantPermission: () -> Unit,
+    onCheckAgain: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val isPermMissing = !status.hasPermission
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            color = AgCardWhite,
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.5.dp, AgDestructive),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("mobile_location_required_dialog")
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .background(AgDestructiveBg, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.LocationOff,
+                        contentDescription = null,
+                        tint = AgDestructive,
+                        modifier = Modifier.size(30.dp)
+                    )
+                }
+
+                Text(
+                    text = "Mobile Location Required",
+                    color = AgForeground,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = if (isPermMissing) {
+                        "Location permission is turned off for this app. Mobile location is mandatory to start an audit — no audit form can be opened while location is off."
+                    } else {
+                        "Your mobile location (GPS) is currently turned OFF. Mobile location is mandatory to start an audit — no audit form can be opened while mobile location is off."
+                    },
+                    color = AgMutedText,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 17.sp
+                )
+
+                Button(
+                    onClick = if (isPermMissing) onGrantPermission else onTurnOnLocation,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = AgActionBlue),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("dialog_enable_location_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MyLocation,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (isPermMissing) "Allow Location Permission" else "Turn On Mobile Location",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, AgBorder),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("dialog_close_location_button")
+                    ) {
+                        Text(
+                            text = "Cancel",
+                            color = AgForeground,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Button(
+                        onClick = onCheckAgain,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AgAccentGreen),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("dialog_retry_open_form_button")
+                    ) {
+                        Text(
+                            text = "Try Again",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
         }
     }
 }

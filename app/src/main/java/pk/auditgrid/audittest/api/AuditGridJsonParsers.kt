@@ -73,6 +73,7 @@ object AuditGridJsonParsers {
         code = o.optString("code"),
         name = o.optString("name"),
         cityId = o.optString("cityId"),
+        cityName = o.optString("cityName"),
         distributorName = o.optString("distributorName"),
         distributorCode = o.optString("distributorCode"),
         assignedAuditorIds = o.optJSONArray("assignedAuditorIds").toStringList(),
@@ -88,8 +89,13 @@ object AuditGridJsonParsers {
         code = o.optString("code"),
         name = o.optString("name"),
         territoryId = o.optString("territoryId"),
+        territoryName = o.optString("territoryName"),
         cityId = o.optString("cityId"),
+        cityName = o.optString("cityName"),
         areaClassification = o.optString("areaClassification", "Urban Commercial"),
+        subLocationsCount = o.optInt("subLocationsCount", 0),
+        shopsCount = o.optInt("shopsCount", 0),
+        gpsStatus = o.optString("gpsStatus", "GPS Verified"),
         lat = o.optDouble("lat", 0.0),
         lng = o.optDouble("lng", 0.0),
         status = o.optString("status", "Active")
@@ -100,10 +106,14 @@ object AuditGridJsonParsers {
         code = o.optString("code"),
         name = o.optString("name"),
         locationId = o.optString("locationId"),
+        locationName = o.optString("locationName"),
         territoryId = o.optString("territoryId"),
+        territoryName = o.optString("territoryName"),
         cityId = o.optString("cityId"),
+        cityName = o.optString("cityName"),
         marketType = o.optString("marketType", "Main Bazaar"),
         postalCode = o.optString("postalCode"),
+        shopsCount = o.optInt("shopsCount", 0),
         lat = o.optDouble("lat", 0.0),
         lng = o.optDouble("lng", 0.0),
         status = o.optString("status", "Active")
@@ -116,10 +126,15 @@ object AuditGridJsonParsers {
         ownerName = o.optString("ownerName"),
         phone = o.optString("phone"),
         subLocationId = o.optString("subLocationId"),
+        subLocationName = o.optString("subLocationName"),
         locationId = o.optString("locationId"),
+        locationName = o.optString("locationName"),
         territoryId = o.optString("territoryId"),
+        territoryName = o.optString("territoryName"),
         cityId = o.optString("cityId"),
-        shopCategory = o.optString("shopCategory", "General Store"),
+        cityName = o.optString("cityName"),
+        shopCategory = o.optString("shopCategory", o.optString("shopType", "General Store")),
+        shopType = o.optString("shopType", o.optString("shopCategory", "General Store")),
         lat = o.optDouble("lat", 0.0),
         lng = o.optDouble("lng", 0.0),
         allowedRadiusMeters = o.optInt("allowedRadiusMeters", 150),
@@ -127,7 +142,9 @@ object AuditGridJsonParsers {
         gpsAccuracyMeters = if (o.has("gpsAccuracyMeters") && !o.isNull("gpsAccuracyMeters")) o.optInt("gpsAccuracyMeters") else null,
         status = o.optString("status", "Active"),
         lastVerifiedAt = o.optString("lastVerifiedAt"),
-        addressLine = o.optString("addressLine")
+        lastAudit = o.optString("lastAudit", "Never"),
+        addressLine = o.optString("addressLine", o.optString("address")),
+        address = o.optString("address", o.optString("addressLine"))
     )
 
     fun parseDistributor(o: JSONObject): Distributor {
@@ -155,6 +172,7 @@ object AuditGridJsonParsers {
             productStatuses = ps,
             lat = o.optDouble("lat", 0.0),
             lng = o.optDouble("lng", 0.0),
+            gpsStatus = o.optString("gpsStatus", "GPS Verified"),
             status = o.optString("status", "Active"),
             createdAt = o.optString("createdAt")
         )
@@ -198,6 +216,7 @@ object AuditGridJsonParsers {
             if (o.optString("id") == RETAIL_FORM_ID) "subLocation" else "distributor"
         },
         description = o.optString("description"),
+        fieldsCount = o.optInt("fieldsCount", o.optJSONArray("fields")?.length() ?: 0),
         requiresBackgroundGPS = o.optBoolean("requiresBackgroundGPS", true),
         allowMultipleEntriesPerProduct = o.optBoolean("allowMultipleEntriesPerProduct", true),
         allowPhotoCapture = o.optBoolean("allowPhotoCapture", true),
@@ -473,11 +492,25 @@ object AuditGridJsonParsers {
                 fcObj.optJSONObject(k)?.let { fcMap[k] = parseFormConfig(it) }
             }
         }
-        val usersList = list("users", ::parseUser).ifEmpty { listOf(fallbackSession.user) }
+        val citiesList = list("cities", ::parseCity)
+        val territoriesList = list("territories", ::parseTerritory)
+        val rawUsers = list("users", ::parseUser).ifEmpty { listOf(fallbackSession.user) }
         val rolesList = list("roles", ::parseRole).ifEmpty { listOfNotNull(fallbackSession.role) }
+
+        // Ensure the active session user is always present in usersList and all users have normalized city & territory links
+        val hasSessionUser = rawUsers.any {
+            it.id == fallbackSession.user.id ||
+                (it.username.isNotBlank() && it.username.equals(fallbackSession.user.username, ignoreCase = true))
+        }
+        val combinedUsers = if (hasSessionUser) rawUsers else (rawUsers + fallbackSession.user)
+        val usersList = combinedUsers.map { u ->
+            val isUserGlobal = (u.id == fallbackSession.user.id && fallbackSession.isGlobal)
+            u.withNormalizedLinks(citiesList, territoriesList, isUserGlobal)
+        }
+
         return BootstrapPayload(
-            cities = list("cities", ::parseCity),
-            territories = list("territories", ::parseTerritory),
+            cities = citiesList,
+            territories = territoriesList,
             locations = list("locations", ::parseLocation),
             subLocations = list("subLocations", ::parseSubLocation),
             shops = list("shops", ::parseShop),
@@ -819,22 +852,54 @@ object AuditGridJsonParsers {
     }
 
     fun parseFormBundle(o: JSONObject): FormBundlePayload {
-        val formsArr = o.optJSONArray("forms")
         val forms = mutableListOf<AuditFormDefinition>()
+        val fcMap = mutableMapOf<String, FormConfigPayload>()
+
+        val formsArr = o.optJSONArray("forms")
         if (formsArr != null) {
             for (i in 0 until formsArr.length()) {
-                formsArr.optJSONObject(i)?.let { forms.add(parseFormDefinition(it)) }
+                val formObj = formsArr.optJSONObject(i) ?: continue
+                val def = parseFormDefinition(formObj)
+                if (def.id.isNotBlank()) {
+                    forms.add(def)
+                    // Support embedded fields/settings or nested config inside each form item
+                    val nestedCfg = formObj.optJSONObject("config")
+                    if (nestedCfg != null) {
+                        fcMap[def.id] = parseFormConfig(nestedCfg).copy(formId = def.id)
+                    } else if (formObj.has("fields") || formObj.has("settings")) {
+                        fcMap[def.id] = parseFormConfig(formObj).copy(formId = def.id)
+                    }
+                }
             }
         }
+
         val fcObj = o.optJSONObject("formConfigs")
-        val fcMap = mutableMapOf<String, FormConfigPayload>()
         if (fcObj != null) {
             val keys = fcObj.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
-                fcObj.optJSONObject(k)?.let { fcMap[k] = parseFormConfig(it) }
+                fcObj.optJSONObject(k)?.let { fcMap[k] = parseFormConfig(it).copy(formId = k) }
             }
         }
+
+        // Also support single-form package: { "form": {...}, "config": {...} } or top-level form object { "id": "...", "title": "...", "fields": [...] }
+        if (forms.isEmpty()) {
+            val singleFormObj = o.optJSONObject("form") ?: if (o.has("id") && o.has("title")) o else null
+            if (singleFormObj != null) {
+                val def = parseFormDefinition(singleFormObj)
+                if (def.id.isNotBlank()) {
+                    forms.add(def)
+                    val cfgObj = o.optJSONObject("config") ?: singleFormObj.optJSONObject("config")
+                        ?: if (o.has("fields") || o.has("settings")) o
+                        else if (singleFormObj.has("fields") || singleFormObj.has("settings")) singleFormObj
+                        else null
+                    if (cfgObj != null) {
+                        fcMap[def.id] = parseFormConfig(cfgObj).copy(formId = def.id)
+                    }
+                }
+            }
+        }
+
         return FormBundlePayload(
             packageVersion = o.optString("packageVersion", "1.0"),
             syncedAt = o.optString("syncedAt", ""),
@@ -844,13 +909,101 @@ object AuditGridJsonParsers {
         )
     }
 
+    fun parseFormBundleFromRawJson(rawJson: String): FormBundlePayload {
+        val trimmed = rawJson.trim()
+        if (trimmed.startsWith("[")) {
+            val arr = JSONArray(trimmed)
+            val wrapper = JSONObject().apply { put("forms", arr) }
+            return parseFormBundle(wrapper)
+        }
+        return parseFormBundle(JSONObject(trimmed))
+    }
+
+    fun serializeUser(u: AppUser): JSONObject = JSONObject().apply {
+        put("id", u.id)
+        put("code", u.code)
+        put("userType", u.userType)
+        put("canLoginFromMobile", u.canLoginFromMobile)
+        put("canLoginFromWeb", u.canLoginFromWeb)
+        put("username", u.username)
+        put("fullName", u.fullName)
+        put("email", u.email)
+        put("phone", u.phone)
+        put("roleId", u.roleId)
+        put("surfaceAccess", u.surfaceAccess)
+        put("assignedCityIds", JSONArray(u.assignedCityIds))
+        put("assignedTerritoryIds", JSONArray(u.assignedTerritoryIds))
+        put("assignedGroupIds", JSONArray(u.assignedGroupIds))
+        put("status", u.status)
+        put("lastActiveAt", u.lastActiveAt)
+    }
+
+    fun serializeRole(r: UserRole): JSONObject = JSONObject().apply {
+        put("id", r.id)
+        put("code", r.code)
+        put("name", r.name)
+        put("surface", r.surface)
+        put("description", r.description)
+        put("isSystemRole", r.isSystemRole)
+        val permsObj = JSONObject()
+        r.permissions.forEach { (k, v) -> permsObj.put(k, v) }
+        put("permissions", permsObj)
+    }
+
+    fun serializeSession(s: Session): JSONObject = JSONObject().apply {
+        put("user", serializeUser(s.user))
+        s.role?.let { put("role", serializeRole(it)) }
+        put("surface", s.surface)
+        put("isGlobal", s.isGlobal)
+    }
+
+    fun parseSession(o: JSONObject): Session = Session(
+        user = parseUser(o.optJSONObject("user") ?: JSONObject()),
+        role = o.optJSONObject("role")?.let { parseRole(it) },
+        surface = o.optString("surface", "mobile"),
+        isGlobal = o.optBoolean("isGlobal", false)
+    )
+
+    fun serializeCity(c: City): JSONObject = JSONObject().apply {
+        put("id", c.id)
+        put("code", c.code)
+        put("name", c.name)
+        put("province", c.province)
+        put("region", c.region)
+        put("lat", c.lat)
+        put("lng", c.lng)
+        put("status", c.status)
+        put("createdAt", c.createdAt)
+    }
+
+    fun serializeTerritory(t: Territory): JSONObject = JSONObject().apply {
+        put("id", t.id)
+        put("code", t.code)
+        put("name", t.name)
+        put("cityId", t.cityId)
+        put("cityName", t.cityName)
+        put("distributorName", t.distributorName)
+        put("distributorCode", t.distributorCode)
+        put("assignedAuditorIds", JSONArray(t.assignedAuditorIds))
+        put("lat", t.lat)
+        put("lng", t.lng)
+        put("status", t.status)
+        put("updatedAt", t.updatedAt)
+        put("version", t.version)
+    }
+
     fun serializeLocation(l: LocationItem): JSONObject = JSONObject().apply {
         if (l.id.isNotBlank()) put("id", l.id)
         put("code", l.code)
         put("name", l.name)
         put("territoryId", l.territoryId)
+        if (l.territoryName.isNotBlank()) put("territoryName", l.territoryName)
         put("cityId", l.cityId)
+        if (l.cityName.isNotBlank()) put("cityName", l.cityName)
         put("areaClassification", l.areaClassification)
+        put("subLocationsCount", l.subLocationsCount)
+        put("shopsCount", l.shopsCount)
+        put("gpsStatus", l.gpsStatus)
         put("lat", l.lat)
         put("lng", l.lng)
         put("status", l.status)
@@ -861,10 +1014,14 @@ object AuditGridJsonParsers {
         put("code", s.code)
         put("name", s.name)
         put("locationId", s.locationId)
+        if (s.locationName.isNotBlank()) put("locationName", s.locationName)
         put("territoryId", s.territoryId)
+        if (s.territoryName.isNotBlank()) put("territoryName", s.territoryName)
         put("cityId", s.cityId)
+        if (s.cityName.isNotBlank()) put("cityName", s.cityName)
         put("marketType", s.marketType)
         put("postalCode", s.postalCode)
+        put("shopsCount", s.shopsCount)
         put("lat", s.lat)
         put("lng", s.lng)
         put("status", s.status)
@@ -877,10 +1034,15 @@ object AuditGridJsonParsers {
         put("ownerName", sh.ownerName)
         put("phone", sh.phone)
         put("subLocationId", sh.subLocationId)
+        if (sh.subLocationName.isNotBlank()) put("subLocationName", sh.subLocationName)
         put("locationId", sh.locationId)
+        if (sh.locationName.isNotBlank()) put("locationName", sh.locationName)
         put("territoryId", sh.territoryId)
+        if (sh.territoryName.isNotBlank()) put("territoryName", sh.territoryName)
         put("cityId", sh.cityId)
-        put("shopCategory", sh.shopCategory)
+        if (sh.cityName.isNotBlank()) put("cityName", sh.cityName)
+        put("shopCategory", sh.shopCategory.ifBlank { sh.shopType })
+        put("shopType", sh.shopType.ifBlank { sh.shopCategory })
         put("lat", sh.lat)
         put("lng", sh.lng)
         put("allowedRadiusMeters", sh.allowedRadiusMeters)
@@ -888,6 +1050,89 @@ object AuditGridJsonParsers {
         sh.gpsAccuracyMeters?.let { put("gpsAccuracyMeters", it) }
         put("status", sh.status)
         put("lastVerifiedAt", sh.lastVerifiedAt)
-        put("addressLine", sh.addressLine)
+        put("lastAudit", sh.lastAudit)
+        put("addressLine", sh.addressLine.ifBlank { sh.address })
+        put("address", sh.address.ifBlank { sh.addressLine })
+    }
+
+    fun serializeDistributor(d: Distributor): JSONObject = JSONObject().apply {
+        put("id", d.id)
+        put("code", d.code)
+        put("setupName", d.setupName)
+        put("distributorName", d.distributorName)
+        put("fatherName", d.fatherName)
+        put("cnic", d.cnic)
+        put("phone", d.phone)
+        put("cityId", d.cityId)
+        put("territoryId", d.territoryId)
+        put("completeAddress", d.completeAddress)
+        put("groupIds", JSONArray(d.groupIds))
+        val psObj = JSONObject()
+        d.productStatuses.forEach { (k, v) -> psObj.put(k, v) }
+        put("productStatuses", psObj)
+        put("lat", d.lat)
+        put("lng", d.lng)
+        put("gpsStatus", d.gpsStatus)
+        put("status", d.status)
+        put("createdAt", d.createdAt)
+    }
+
+    fun serializeProductGroup(g: ProductGroup): JSONObject = JSONObject().apply {
+        put("id", g.id)
+        put("code", g.code)
+        put("name", g.name)
+        put("divisionTitle", g.divisionTitle)
+        put("description", g.description)
+        put("storageType", g.storageType)
+        put("defaultStackingMaxCtn", g.defaultStackingMaxCtn)
+        put("badgeStyle", g.badgeStyle)
+        put("status", g.status)
+    }
+
+    fun serializeProduct(p: Product): JSONObject = JSONObject().apply {
+        put("id", p.id)
+        put("sku", p.sku)
+        put("name", p.name)
+        put("groupId", p.groupId)
+        put("groupName", p.groupName)
+        put("unitPerBox", p.unitPerBox)
+        put("unitsCountPerBox", p.unitsCountPerBox)
+        put("boxesPerCtn", p.boxesPerCtn)
+        put("pricePerBoxRs", p.pricePerBoxRs)
+        put("stackingStandard", p.stackingStandard)
+        put("shelfLifeDays", p.shelfLifeDays)
+        put("status", p.status)
+    }
+
+    fun serializePlanItem(item: PlanItem): JSONObject = JSONObject().apply {
+        put("id", item.id)
+        put("formId", item.formId)
+        put("formTitle", item.formTitle)
+        put("targetType", item.targetType)
+        put("targetId", item.targetId)
+        put("targetLabel", item.targetLabel)
+        put("cityId", item.cityId)
+        put("territoryId", item.territoryId)
+        put("shopIds", JSONArray(item.shopIds))
+        put("status", item.status)
+        item.doneAt?.let { put("doneAt", it) }
+        item.reportKind?.let { put("reportKind", it) }
+        item.reportId?.let { put("reportId", it) }
+        item.reportCode?.let { put("reportCode", it) }
+        item.skipReason?.let { put("skipReason", it) }
+    }
+
+    fun serializePlan(p: AuditPlan): JSONObject = JSONObject().apply {
+        put("id", p.id)
+        put("auditorId", p.auditorId)
+        p.auditorName?.let { put("auditorName", it) }
+        put("planDate", p.planDate)
+        put("title", p.title)
+        put("notes", p.notes)
+        put("status", p.status)
+        p.startedAt?.let { put("startedAt", it) }
+        val itemsArr = JSONArray()
+        p.items.forEach { itemsArr.put(serializePlanItem(it)) }
+        put("items", itemsArr)
     }
 }

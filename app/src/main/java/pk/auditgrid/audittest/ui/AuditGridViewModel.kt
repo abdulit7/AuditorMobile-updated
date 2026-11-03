@@ -243,7 +243,9 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
     private suspend fun loadAllData(s: Session) {
         try {
             val boot = apiClient.fetchBootstrap(s)
+            val updatedSession = apiClient.getUpdatedSessionFromMobileDb(s)
             val bundle = runCatching { apiClient.fetchFormBundle() }.getOrNull()
+            runCatching { apiClient.fetchPlans(inProgressOnly = false) }
             val dr = runCatching { apiClient.fetchDistributorReports() }.getOrNull()
             val rr = runCatching { apiClient.fetchRetailReports() }.getOrNull()
             val cs = runCatching { apiClient.fetchCustomSubmissions() }.getOrNull()
@@ -252,40 +254,49 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
             val mergedRetail = mergeById(rr, _uiState.value.retailReports) { it.id }
             val mergedCustom = mergeById(cs, _uiState.value.customSubmissions) { it.id }
 
-            apiClient.saveCachedDistributorReports(s.user.id, mergedDist)
-            apiClient.saveCachedRetailReports(s.user.id, mergedRetail)
-            apiClient.saveCachedCustomSubmissions(s.user.id, mergedCustom)
+            apiClient.saveCachedDistributorReports(updatedSession.user.id, mergedDist)
+            apiClient.saveCachedRetailReports(updatedSession.user.id, mergedRetail)
+            apiClient.saveCachedCustomSubmissions(updatedSession.user.id, mergedCustom)
 
-            val cachedForms = apiClient.loadCachedForms(s.user.id)
-            val cachedConfigs = apiClient.loadCachedFormConfigs(s.user.id)
+            val cachedForms = apiClient.loadCachedForms(updatedSession.user.id)
+            val cachedConfigs = apiClient.loadCachedFormConfigs(updatedSession.user.id)
 
             // When online against the server, use the server bundle/bootstrap as authoritative so web edits & deletions sync cleanly
-            val authoritativeForms = when {
+            val serverForms = when {
                 bundle != null && bundle.forms.isNotEmpty() -> bundle.forms
                 boot.forms.isNotEmpty() -> boot.forms
-                else -> cachedForms
+                else -> emptyList()
             }
-            val authoritativeConfigs: FormConfigMap = when {
+            val serverConfigs: FormConfigMap = when {
                 bundle != null && bundle.formConfigs.isNotEmpty() -> bundle.formConfigs
                 boot.formConfigs.isNotEmpty() -> boot.formConfigs
-                else -> cachedConfigs
+                else -> emptyMap()
             }
             val effectiveHash = bundle?.bundleHash?.ifBlank { boot.formsBundleHash } ?: boot.formsBundleHash
 
-            if (authoritativeForms.isNotEmpty()) {
-                apiClient.saveCachedForms(s.user.id, authoritativeForms)
-                apiClient.saveCachedFormConfigs(s.user.id, authoritativeConfigs)
-                if (effectiveHash.isNotBlank()) {
-                    apiClient.saveCachedBundleHash(s.user.id, effectiveHash)
-                }
-                apiClient.setFormsSyncedOnce(s.user.id, true)
+            val (authoritativeForms, authoritativeConfigs) = if (serverForms.isNotEmpty()) {
+                apiClient.saveServerSyncedForms(
+                    auditorId = updatedSession.user.id,
+                    serverForms = serverForms,
+                    serverConfigs = serverConfigs,
+                    bundleHash = effectiveHash
+                )
+            } else {
+                cachedForms to cachedConfigs
             }
+
+            val cityIdsSet = boot.cities.map { it.id }.toSet()
+            val terIdsSet = boot.territories.map { it.id }.toSet()
+            val locIdsSet = boot.locations.map { it.id }.toSet()
+            val subIdsSet = boot.subLocations.map { it.id }.toSet()
 
             val nowStr = currentTimePkt()
             _uiState.update {
                 it.copy(
+                    session = updatedSession,
                     loadError = null,
                     lastSyncedAt = nowStr,
+                    plansRefreshVersion = it.plansRefreshVersion + 1,
                     cities = boot.cities,
                     territories = boot.territories,
                     locations = boot.locations,
@@ -303,12 +314,18 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                     mapsApiKey = boot.mapsApiKey,
                     auditReports = mergedDist,
                     retailReports = mergedRetail,
-                    customSubmissions = mergedCustom
+                    customSubmissions = mergedCustom,
+                    filterCityId = if (it.filterCityId in cityIdsSet) it.filterCityId else "",
+                    filterTerritoryId = if (it.filterTerritoryId in terIdsSet) it.filterTerritoryId else "",
+                    filterLocationId = if (it.filterLocationId in locIdsSet) it.filterLocationId else "",
+                    filterSubLocationId = if (it.filterSubLocationId in subIdsSet) it.filterSubLocationId else ""
                 )
             }
             checkLiveSharingStatus()
         } catch (e: Exception) {
-            val hasOfflineCache = _uiState.value.cities.isNotEmpty() || _uiState.value.auditForms.isNotEmpty()
+            val hasOfflineCache = _uiState.value.cities.isNotEmpty() ||
+                _uiState.value.territories.isNotEmpty() ||
+                _uiState.value.auditForms.isNotEmpty()
             if (hasOfflineCache) {
                 _uiState.update { it.copy(loadError = null) }
             } else {
@@ -331,12 +348,13 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
     /**
      * Full two-way sync:
      * 1. Uploads any queued offline audit reports from `pendingOutbox`.
-     * 2. Refreshes cities, territories, locations, sub-locations, shops, distributors, groups, and SKUs (`/api/bootstrap`).
-     * 3. Refreshes submitted reports (`/api/reports/distributor`, `/api/reports/retail`, `/api/submissions`).
+     * 2. Refreshes users, roles, cities, territories, locations, sub-locations, shops, distributors, groups, and SKUs (`/api/bootstrap`)
+     *    and updates the mobile SQLite database (`AuditGridMobileDatabase`) and the logged-in user's session/assignments.
+     * 3. Refreshes submitted reports (`/api/reports/distributor`, `/api/reports/retail`, `/api/submissions`) and daily plans (`/api/plans`).
      * 4. Fetches the authoritative Form Bundle (`/api/forms/bundle`) from the web application:
      *    - Inserts any newly created web forms into the mobile database
      *    - Updates any existing forms whose fields, options, settings, or versions changed on the web application
-     *    - Removes any forms deleted on the web application
+     *    - Removes any server forms deleted on the web application while preserving manually imported package forms
      *    - Saves all synced forms & configs on the phone for offline & online use.
      */
     fun syncAllNow(manual: Boolean = false) {
@@ -399,8 +417,10 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                 apiClient.saveOutboxItems(s.user.id, remainingOutbox)
                 _uiState.update { it.copy(pendingOutbox = remainingOutbox) }
 
-                // Refresh bootstrap master data & reports
+                // Refresh bootstrap master data (users, roles, cities, territories, locations, subLocations, shops, distributors, products)
                 val boot = apiClient.fetchBootstrap(s)
+                val updatedSession = apiClient.getUpdatedSessionFromMobileDb(s)
+                runCatching { apiClient.fetchPlans(inProgressOnly = false) }
                 val dr = runCatching { apiClient.fetchDistributorReports() }.getOrNull()
                 val rr = runCatching { apiClient.fetchRetailReports() }.getOrNull()
                 val cs = runCatching { apiClient.fetchCustomSubmissions() }.getOrNull()
@@ -412,27 +432,30 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                     else -> runCatching { apiClient.fetchForms() }.getOrDefault(boot.forms)
                 }
 
-                val syncedForms = if (remoteForms.isNotEmpty()) remoteForms else _uiState.value.auditForms
-                val syncedConfigs = mutableMapOf<String, FormConfigPayload>()
+                val rawConfigs = mutableMapOf<String, FormConfigPayload>()
                 if (remoteBundle != null && remoteBundle.formConfigs.isNotEmpty()) {
-                    syncedConfigs.putAll(remoteBundle.formConfigs)
+                    rawConfigs.putAll(remoteBundle.formConfigs)
                 } else {
-                    syncedConfigs.putAll(boot.formConfigs)
-                    for (f in syncedForms) {
+                    rawConfigs.putAll(boot.formConfigs)
+                    for (f in remoteForms) {
                         runCatching { apiClient.fetchFormConfig(f.id) }.getOrNull()?.let { cfg ->
-                            syncedConfigs[f.id] = cfg
+                            rawConfigs[f.id] = cfg
                         }
                     }
                 }
                 val newBundleHash = remoteBundle?.bundleHash?.ifBlank { boot.formsBundleHash } ?: boot.formsBundleHash
 
-                // Persist synced forms & field configs on phone for offline and online use
-                apiClient.saveCachedForms(s.user.id, syncedForms)
-                apiClient.saveCachedFormConfigs(s.user.id, syncedConfigs)
-                if (newBundleHash.isNotBlank()) {
-                    apiClient.saveCachedBundleHash(s.user.id, newBundleHash)
+                // Persist synced server forms & field configs in mobile SQLite DB while preserving manually imported package forms
+                val (syncedForms, syncedConfigs) = if (remoteForms.isNotEmpty()) {
+                    apiClient.saveServerSyncedForms(
+                        auditorId = updatedSession.user.id,
+                        serverForms = remoteForms,
+                        serverConfigs = rawConfigs,
+                        bundleHash = newBundleHash
+                    )
+                } else {
+                    apiClient.loadCachedForms(updatedSession.user.id) to apiClient.loadCachedFormConfigs(updatedSession.user.id)
                 }
-                apiClient.setFormsSyncedOnce(s.user.id, true)
 
                 val newlyInsertedForms = syncedForms.filter { it.id !in previousFormsById }
                 val updatedWebForms = syncedForms.filter { f ->
@@ -446,14 +469,21 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                 val mergedRetail = mergeById(rr, _uiState.value.retailReports) { it.id }
                 val mergedCustom = mergeById(cs, _uiState.value.customSubmissions) { it.id }
 
-                apiClient.saveCachedDistributorReports(s.user.id, mergedDist)
-                apiClient.saveCachedRetailReports(s.user.id, mergedRetail)
-                apiClient.saveCachedCustomSubmissions(s.user.id, mergedCustom)
+                apiClient.saveCachedDistributorReports(updatedSession.user.id, mergedDist)
+                apiClient.saveCachedRetailReports(updatedSession.user.id, mergedRetail)
+                apiClient.saveCachedCustomSubmissions(updatedSession.user.id, mergedCustom)
+
+                val cityIdsSet = boot.cities.map { it.id }.toSet()
+                val terIdsSet = boot.territories.map { it.id }.toSet()
+                val locIdsSet = boot.locations.map { it.id }.toSet()
+                val subIdsSet = boot.subLocations.map { it.id }.toSet()
 
                 val syncedTime = currentTimePkt()
                 _uiState.update {
                     it.copy(
+                        session = updatedSession,
                         online = true,
+                        loadError = null,
                         lastSyncedAt = syncedTime,
                         plansRefreshVersion = it.plansRefreshVersion + 1,
                         cities = boot.cities,
@@ -466,7 +496,7 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                         products = boot.products,
                         users = boot.users,
                         roles = boot.roles,
-                        formsSyncedOnce = true,
+                        formsSyncedOnce = syncedForms.isNotEmpty(),
                         auditForms = syncedForms,
                         formConfigs = syncedConfigs,
                         formsBundleHash = newBundleHash.ifBlank { it.formsBundleHash },
@@ -475,18 +505,24 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                         mapsApiKey = boot.mapsApiKey,
                         auditReports = mergedDist,
                         retailReports = mergedRetail,
-                        customSubmissions = mergedCustom
+                        customSubmissions = mergedCustom,
+                        filterCityId = if (it.filterCityId in cityIdsSet) it.filterCityId else "",
+                        filterTerritoryId = if (it.filterTerritoryId in terIdsSet) it.filterTerritoryId else "",
+                        filterLocationId = if (it.filterLocationId in locIdsSet) it.filterLocationId else "",
+                        filterSubLocationId = if (it.filterSubLocationId in subIdsSet) it.filterSubLocationId else "",
+                        selectedShop = it.selectedShop?.let { sel -> boot.shops.find { sh -> sh.id == sel.id } },
+                        selectedDistributor = it.selectedDistributor?.let { sel -> boot.distributors.find { d -> d.id == sel.id } }
                     )
                 }
                 checkLiveSharingStatus()
 
                 if (flushedCount > 0 && failedCount == 0) {
-                    showToast("Synced $flushedCount queued audit(s) and saved ${syncedForms.size} form(s) on phone.")
+                    showToast("Synced $flushedCount queued audit(s), user data & ${syncedForms.size} form(s) to mobile DB.")
                 } else if (flushedCount > 0 && failedCount > 0) {
                     showToast("Uploaded $flushedCount audit(s); $failedCount still in outbox.")
                 } else if (newlyInsertedForms.isNotEmpty() || updatedWebForms.isNotEmpty()) {
                     if (previousFormsById.isEmpty()) {
-                        showToast("Synced ${syncedForms.size} audit form(s) from web application & saved on phone for offline/online use.")
+                        showToast("Synced ${syncedForms.size} audit form(s) & user data from server to mobile DB.")
                     } else {
                         val parts = mutableListOf<String>()
                         if (newlyInsertedForms.isNotEmpty()) {
@@ -495,18 +531,18 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
                         if (updatedWebForms.isNotEmpty()) {
                             parts.add("${updatedWebForms.size} updated (${updatedWebForms.joinToString(", ") { it.code }})")
                         }
-                        showToast("Synced web form changes: ${parts.joinToString(" & ")} saved to phone DB.")
+                        showToast("Synced server changes: ${parts.joinToString(" & ")} saved to mobile DB.")
                     }
                 } else if (manual) {
                     if (failedCount > 0) {
                         showToast("$failedCount queued audit(s) could not be uploaded yet.")
                     } else {
-                        showToast("Synced all ${syncedForms.size} forms (v-hash ${newBundleHash.take(8)}), places, SKUs & plans ($syncedTime).")
+                        showToast("Synced user profile, roles, cities, territories, places, SKUs & ${syncedForms.size} forms ($syncedTime).")
                     }
                 }
             } catch (e: Exception) {
                 if (manual) {
-                    val msg = if (e is ApiError) e.message else "Cannot reach server right now. Saved forms remain available offline."
+                    val msg = if (e is ApiError) e.message else "Cannot reach server right now. Saved mobile DB data remains available offline."
                     showToast(msg)
                 }
             } finally {
@@ -675,32 +711,56 @@ class AuditGridViewModel(application: Application) : AndroidViewModel(applicatio
         apiClient.updatePlaceGps(targetType, targetId, lat, lng, accuracy)
         _uiState.update { state ->
             when (targetType) {
-                "location" -> state.copy(
-                    locations = state.locations.map {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
+                "location" -> {
+                    val updatedList = state.locations.map {
+                        if (it.id == targetId) {
+                            val updated = it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified")
+                            apiClient.mobileDb.upsertLocation(updated)
+                            updated
+                        } else it
                     }
-                )
-                "subLocation" -> state.copy(
-                    subLocations = state.subLocations.map {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, status = "Verified") else it
+                    state.copy(locations = updatedList)
+                }
+                "subLocation" -> {
+                    val updatedList = state.subLocations.map {
+                        if (it.id == targetId) {
+                            val updated = it.copy(lat = lat, lng = lng, status = "Verified")
+                            apiClient.mobileDb.upsertSubLocation(updated)
+                            updated
+                        } else it
                     }
-                )
-                "shop" -> state.copy(
-                    shops = state.shops.map {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
-                    },
-                    selectedShop = state.selectedShop?.let {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
+                    state.copy(subLocations = updatedList)
+                }
+                "shop" -> {
+                    val updatedList = state.shops.map {
+                        if (it.id == targetId) {
+                            val updated = it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified")
+                            apiClient.mobileDb.upsertShop(updated)
+                            updated
+                        } else it
                     }
-                )
-                "distributor" -> state.copy(
-                    distributors = state.distributors.map {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
-                    },
-                    selectedDistributor = state.selectedDistributor?.let {
-                        if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
+                    state.copy(
+                        shops = updatedList,
+                        selectedShop = state.selectedShop?.let {
+                            if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
+                        }
+                    )
+                }
+                "distributor" -> {
+                    val updatedList = state.distributors.map {
+                        if (it.id == targetId) {
+                            val updated = it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified")
+                            apiClient.mobileDb.upsertDistributor(updated)
+                            updated
+                        } else it
                     }
-                )
+                    state.copy(
+                        distributors = updatedList,
+                        selectedDistributor = state.selectedDistributor?.let {
+                            if (it.id == targetId) it.copy(lat = lat, lng = lng, gpsStatus = "GPS Verified") else it
+                        }
+                    )
+                }
                 else -> state
             }
         }

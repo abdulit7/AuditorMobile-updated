@@ -72,7 +72,7 @@ fun CustomAuditFormScreen(
         else -> "Distributor"
     }
 
-    val terrs = remember(activeAuditor.id) { activeAuditor.assignedTerritoryIds.toSet() }
+    val terrs = remember(activeAuditor, territories) { activeAuditor.linkedTerritoryIds(territories) }
     val options = remember(targetType, distributors, subLocations, shops, terrs) {
         when (targetType) {
             "subLocation" -> subLocations

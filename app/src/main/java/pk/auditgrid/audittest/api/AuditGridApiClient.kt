@@ -29,6 +29,8 @@ class AuditGridApiClient(context: Context) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences("auditgrid_prefs", Context.MODE_PRIVATE)
 
+    val mobileDb: AuditGridMobileDatabase = AuditGridMobileDatabase(context.applicationContext)
+
     @Volatile
     private var accessToken: String? = null
     private val refreshMutex = Mutex()
@@ -38,35 +40,46 @@ class AuditGridApiClient(context: Context) {
         private const val BASE_KEY = "ag.apiBase"
         private const val RT_KEY = "ag.refreshToken"
         private const val SESSION_USER_KEY = "ag.session.username"
+        private const val SESSION_USER_ID_KEY = "ag.session.userId"
         private const val LOCAL_SESSION_KEY = "ag.session.local"
         private const val LOGGED_OUT_KEY = "ag.session.loggedOut"
 
         fun normalizeBase(v: String): String = v.trim().trimEnd('/')
     }
 
-    @Volatile
-    private var localPlansList: MutableList<AuditPlan> = mutableListOf()
-
     init {
-        // Purge any legacy dummy completed reports or demo flags from earlier builds
-        if (prefs.contains("ag.demoMode") ||
+        // Purge any legacy dummy or fake local fallback data from earlier builds
+        val wasFakeLocalSession = prefs.getBoolean(LOCAL_SESSION_KEY, false)
+        val savedUserId = prefs.getString(SESSION_USER_ID_KEY, "") ?: ""
+        if (wasFakeLocalSession ||
+            savedUserId.startsWith("usr-local-") ||
+            prefs.contains("ag.demoMode") ||
             prefs.contains("ag.demoSeeded") ||
             prefs.contains("ag.completed.dist.usr-demo-auditor-01") ||
             prefs.contains("ag.completed.retail.usr-demo-auditor-01") ||
             prefs.contains("ag.completed.custom.usr-demo-auditor-01")
         ) {
-            prefs.edit()
+            val ed = prefs.edit()
+                .remove(LOCAL_SESSION_KEY)
                 .remove("ag.demoMode")
                 .remove("ag.demoSeeded")
                 .remove("ag.demo.webCreatedCount")
                 .remove("ag.completed.dist.usr-demo-auditor-01")
                 .remove("ag.completed.retail.usr-demo-auditor-01")
                 .remove("ag.completed.custom.usr-demo-auditor-01")
-                .apply()
+            if (wasFakeLocalSession || savedUserId.startsWith("usr-local-")) {
+                ed.remove(SESSION_USER_KEY)
+                ed.remove(SESSION_USER_ID_KEY)
+                ed.remove(RT_KEY)
+            }
+            ed.apply()
         }
     }
 
-    fun isLocalFallbackSession(): Boolean = prefs.getBoolean(LOCAL_SESSION_KEY, false)
+    private fun currentAuditorId(): String =
+        prefs.getString(SESSION_USER_ID_KEY, null)?.takeIf { it.isNotBlank() }
+            ?: prefs.getString(SESSION_USER_KEY, null)?.let { mobileDb.loadSessionByUsername(it)?.user?.id }
+            ?: ""
 
     fun getApiBase(): String {
         val stored = prefs.getString(BASE_KEY, null)
@@ -90,42 +103,37 @@ class AuditGridApiClient(context: Context) {
     }
 
     fun hasStoredSession(): Boolean {
-        if (isLocalFallbackSession() && !prefs.getString(SESSION_USER_KEY, null).isNullOrBlank()) {
+        if (prefs.getBoolean(LOGGED_OUT_KEY, false)) return false
+        val savedUsername = prefs.getString(SESSION_USER_KEY, null)
+        if (!savedUsername.isNullOrBlank() && mobileDb.loadSessionByUsername(savedUsername) != null) {
             return true
         }
         return !prefs.getString(RT_KEY, null).isNullOrBlank() && getConfiguredServerUrl().isNotBlank()
     }
 
-    private fun applySession(p: JSONObject): Session {
+    private fun applySession(p: JSONObject, passwordPlain: String? = null): Session {
         accessToken = p.optString("accessToken").takeIf { it.isNotEmpty() }
         val rt = p.optString("refreshToken")
         val userObj = p.optJSONObject("user") ?: JSONObject()
         val parsedUser = AuditGridJsonParsers.parseUser(userObj)
-        val ed = prefs.edit()
-            .putBoolean(LOCAL_SESSION_KEY, false)
-            .putBoolean(LOGGED_OUT_KEY, false)
-            .putString(SESSION_USER_KEY, parsedUser.username)
-        if (rt.isNotEmpty()) {
-            ed.putString(RT_KEY, rt)
-        }
-        ed.apply()
         val roleObj = p.optJSONObject("role")
-        return Session(
+        val session = Session(
             user = parsedUser,
             role = roleObj?.let { AuditGridJsonParsers.parseRole(it) },
             surface = p.optString("surface", "mobile"),
             isGlobal = p.optBoolean("isGlobal", false)
         )
-    }
-
-    fun signInLocalSession(username: String): Session {
-        val clean = username.trim().ifBlank { "auditor" }
-        prefs.edit()
-            .putBoolean(LOCAL_SESSION_KEY, true)
+        val ed = prefs.edit()
+            .putBoolean(LOCAL_SESSION_KEY, false)
             .putBoolean(LOGGED_OUT_KEY, false)
-            .putString(SESSION_USER_KEY, clean)
-            .apply()
-        return DefaultServerCatalog.buildSession(clean)
+            .putString(SESSION_USER_KEY, parsedUser.username)
+            .putString(SESSION_USER_ID_KEY, parsedUser.id)
+        if (rt.isNotEmpty()) {
+            ed.putString(RT_KEY, rt)
+        }
+        ed.apply()
+        mobileDb.saveUserSession(session, passwordPlain)
+        return session
     }
 
     suspend fun checkServer(base: String): Boolean = withContext(Dispatchers.IO) {
@@ -161,8 +169,8 @@ class AuditGridApiClient(context: Context) {
         try {
             val url = URL(base + path)
             val conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 4000
-                readTimeout = 6000
+                connectTimeout = 5000
+                readTimeout = 8000
                 if (method == "PATCH") {
                     try {
                         requestMethod = "PATCH"
@@ -210,11 +218,11 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun refreshSession(): Session? = refreshMutex.withLock {
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            return@withLock DefaultServerCatalog.buildSession(savedUser)
+        val savedUser = prefs.getString(SESSION_USER_KEY, null)
+        val token = prefs.getString(RT_KEY, null)
+        if (token.isNullOrBlank()) {
+            return@withLock savedUser?.let { mobileDb.loadSessionByUsername(it) }
         }
-        val token = prefs.getString(RT_KEY, null) ?: return@withLock null
         try {
             val payload = JSONObject().apply {
                 put("client", "native")
@@ -225,21 +233,22 @@ class AuditGridApiClient(context: Context) {
                 accessToken = null
                 if (status == 401) {
                     prefs.edit().remove(RT_KEY).apply()
+                    return@withLock null
                 }
-                return@withLock null
+                return@withLock savedUser?.let { mobileDb.loadSessionByUsername(it) }
             }
             applySession(JSONObject(body))
         } catch (e: ApiError) {
             if (e.isNetwork) {
-                val savedUser = prefs.getString(SESSION_USER_KEY, null)
                 if (!savedUser.isNullOrBlank()) {
-                    return@withLock DefaultServerCatalog.buildSession(savedUser)
+                    val cached = mobileDb.loadSessionByUsername(savedUser)
+                    if (cached != null) return@withLock cached
                 }
                 throw e
             }
             null
         } catch (_: Exception) {
-            null
+            savedUser?.let { mobileDb.loadSessionByUsername(it) }
         }
     }
 
@@ -251,7 +260,7 @@ class AuditGridApiClient(context: Context) {
         var (status, body) = sendRaw(path, method, jsonBody)
         if (status == 401 && !path.startsWith("/api/auth/")) {
             val refreshed = runCatching { refreshSession() }.getOrNull()
-            if (refreshed != null) {
+            if (refreshed != null && !accessToken.isNullOrEmpty()) {
                 val retry = sendRaw(path, method, jsonBody)
                 status = retry.first
                 body = retry.second
@@ -268,40 +277,57 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun login(username: String, password: String): Session {
+        val cleanUser = username.trim()
         val payload = JSONObject().apply {
-            put("username", username)
+            put("username", cleanUser)
             put("password", password)
             put("surface", "mobile")
             put("client", "native")
         }
-        val (status, body) = sendRaw("/api/auth/login", "POST", payload)
-        if (status !in 200..299) throw readError(status, body)
-        return applySession(JSONObject(body))
+        return try {
+            val (status, body) = sendRaw("/api/auth/login", "POST", payload)
+            if (status !in 200..299) throw readError(status, body)
+            applySession(JSONObject(body), passwordPlain = password)
+        } catch (e: ApiError) {
+            if (e.isNetwork) {
+                // Only allow offline login if this user was previously downloaded from the server into mobileDb
+                val offlineSession = mobileDb.authenticateOfflineUser(cleanUser, password)
+                if (offlineSession != null) {
+                    prefs.edit()
+                        .putBoolean(LOCAL_SESSION_KEY, false)
+                        .putBoolean(LOGGED_OUT_KEY, false)
+                        .putString(SESSION_USER_KEY, offlineSession.user.username)
+                        .putString(SESSION_USER_ID_KEY, offlineSession.user.id)
+                        .apply()
+                    return offlineSession
+                }
+                throw ApiError(
+                    "Cannot reach the server (${getConfiguredServerUrl()}). Please connect to the server to sign in and download your user account, role, cities, territories, and forms.",
+                    0
+                )
+            }
+            throw e
+        }
     }
 
     suspend fun restoreSession(): Session? {
         if (prefs.getBoolean(LOGGED_OUT_KEY, false)) {
             return null
         }
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            return DefaultServerCatalog.buildSession(savedUser)
-        }
+        val savedUser = prefs.getString(SESSION_USER_KEY, null)?.takeIf { it.isNotBlank() } ?: return null
         if (!hasStoredSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            return signInLocalSession(savedUser)
+            return null
         }
         return try {
-            refreshSession() ?: signInLocalSession(prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor")
+            refreshSession() ?: mobileDb.loadSessionByUsername(savedUser)
         } catch (_: Exception) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            DefaultServerCatalog.buildSession(savedUser)
+            mobileDb.loadSessionByUsername(savedUser)
         }
     }
 
     suspend fun logout() {
         val token = prefs.getString(RT_KEY, null)
-        if (!isLocalFallbackSession() && !token.isNullOrEmpty()) {
+        if (!token.isNullOrEmpty()) {
             try {
                 val payload = JSONObject().apply {
                     put("client", "native")
@@ -315,13 +341,13 @@ class AuditGridApiClient(context: Context) {
         prefs.edit()
             .remove(RT_KEY)
             .remove(SESSION_USER_KEY)
+            .remove(SESSION_USER_ID_KEY)
             .putBoolean(LOCAL_SESSION_KEY, false)
             .putBoolean(LOGGED_OUT_KEY, true)
             .apply()
     }
 
     suspend fun changePassword(currentPassword: String, newPassword: String) {
-        if (isLocalFallbackSession()) return
         val payload = JSONObject().apply {
             put("currentPassword", currentPassword)
             put("newPassword", newPassword)
@@ -329,27 +355,39 @@ class AuditGridApiClient(context: Context) {
         requestJson("/api/auth/change-password", "POST", payload)
     }
 
+    /**
+     * Downloads users, roles, cities, territories, locations, sub-locations, shops,
+     * distributors, product groups, products, and forms from the server, links them
+     * to each user, and saves everything into `AuditGridMobileDatabase`.
+     */
     suspend fun fetchBootstrap(session: Session): BootstrapPayload {
-        if (isLocalFallbackSession()) {
-            return DefaultServerCatalog.buildBootstrap(session)
-        }
         return try {
             val body = requestJson("/api/bootstrap")
-            saveRawBootstrapCache(session.user.id, body)
-            AuditGridJsonParsers.parseBootstrap(JSONObject(body), session)
+            val parsed = AuditGridJsonParsers.parseBootstrap(JSONObject(body), session)
+            val updatedSession = withContext(Dispatchers.IO) {
+                mobileDb.saveBootstrapForUser(session, parsed)
+            }
+            prefs.edit()
+                .putString(SESSION_USER_KEY, updatedSession.user.username)
+                .putString(SESSION_USER_ID_KEY, updatedSession.user.id)
+                .apply()
+            parsed
         } catch (e: ApiError) {
             if (e.isNetwork) {
-                loadCachedBootstrap(session.user.id, session) ?: DefaultServerCatalog.buildBootstrap(session)
+                withContext(Dispatchers.IO) {
+                    mobileDb.loadBootstrapForUser(session)
+                } ?: throw e
             } else {
                 throw e
             }
         }
     }
 
+    fun getUpdatedSessionFromMobileDb(currentSession: Session): Session {
+        return mobileDb.loadSessionByUsername(currentSession.user.username) ?: currentSession
+    }
+
     suspend fun fetchForms(): List<AuditFormDefinition> {
-        if (isLocalFallbackSession()) {
-            return DefaultServerCatalog.forms
-        }
         return try {
             val body = requestJson("/api/forms")
             val arr = JSONArray(body)
@@ -357,71 +395,88 @@ class AuditGridApiClient(context: Context) {
                 arr.optJSONObject(i)?.let { AuditGridJsonParsers.parseFormDefinition(it) }
             }
         } catch (e: ApiError) {
-            if (e.isNetwork) DefaultServerCatalog.forms else throw e
+            if (e.isNetwork) {
+                val uid = currentAuditorId()
+                if (uid.isNotBlank()) mobileDb.loadFormsForUser(uid) else emptyList()
+            } else {
+                throw e
+            }
         }
     }
 
     suspend fun fetchFormBundle(): FormBundlePayload {
-        if (isLocalFallbackSession()) {
-            return FormBundlePayload(
-                packageVersion = "1.0",
-                syncedAt = pk.auditgrid.audittest.util.currentIsoTimestamp(),
-                bundleHash = "local-fallback",
-                forms = DefaultServerCatalog.forms,
-                formConfigs = DefaultServerCatalog.formConfigs
-            )
-        }
         val body = requestJson("/api/forms/bundle")
         return AuditGridJsonParsers.parseFormBundle(JSONObject(body))
     }
 
+    /**
+     * Imports a Form Package (.json) manually and merges its forms & field configs
+     * into the user's mobile SQLite database (`AuditGridMobileDatabase`).
+     */
     fun importFormBundleJson(auditorId: String, rawJson: String): FormBundlePayload {
-        val obj = JSONObject(rawJson)
-        val bundle = AuditGridJsonParsers.parseFormBundle(obj)
-        if (bundle.forms.isEmpty()) {
+        val parsedBundle = AuditGridJsonParsers.parseFormBundleFromRawJson(rawJson)
+        if (parsedBundle.forms.isEmpty()) {
             throw IllegalArgumentException("Form package JSON does not contain any audit forms.")
         }
-        saveCachedForms(auditorId, bundle.forms)
-        saveCachedFormConfigs(auditorId, bundle.formConfigs)
-        if (bundle.bundleHash.isNotBlank()) {
-            saveCachedBundleHash(auditorId, bundle.bundleHash)
+        // Ensure every imported form has a default config entry if not explicitly provided
+        val enrichedConfigs = parsedBundle.formConfigs.toMutableMap()
+        for (f in parsedBundle.forms) {
+            if (!enrichedConfigs.containsKey(f.id)) {
+                enrichedConfigs[f.id] = FormConfigPayload(formId = f.id, version = f.version.coerceAtLeast(1))
+            }
         }
-        setFormsSyncedOnce(auditorId, true)
-        return bundle
+        val normalizedBundle = parsedBundle.copy(formConfigs = enrichedConfigs)
+        val (mergedForms, mergedConfigs) = mobileDb.importManualFormBundleForUser(auditorId, normalizedBundle)
+        return normalizedBundle.copy(
+            forms = mergedForms,
+            formConfigs = mergedConfigs
+        )
+    }
+
+    fun saveServerSyncedForms(
+        auditorId: String,
+        serverForms: List<AuditFormDefinition>,
+        serverConfigs: FormConfigMap,
+        bundleHash: String = ""
+    ): Pair<List<AuditFormDefinition>, FormConfigMap> {
+        return mobileDb.saveServerFormsForUser(auditorId, serverForms, serverConfigs, bundleHash)
     }
 
     fun loadCachedBundleHash(auditorId: String): String =
-        prefs.getString("ag.forms.bundleHash.$auditorId", "") ?: ""
+        mobileDb.loadBundleHashForUser(auditorId)
 
     fun saveCachedBundleHash(auditorId: String, hash: String) {
-        prefs.edit().putString("ag.forms.bundleHash.$auditorId", hash).apply()
+        mobileDb.saveBundleHashForUser(auditorId, hash)
     }
 
     suspend fun createLocation(location: LocationItem): LocationItem {
-        if (isLocalFallbackSession()) {
-            return location.copy(id = location.id.ifBlank { "loc-${System.currentTimeMillis()}" })
-        }
         val payload = AuditGridJsonParsers.serializeLocation(location)
         val res = requestJson("/api/locations", "POST", payload)
-        return AuditGridJsonParsers.parseLocation(JSONObject(res))
+        val saved = AuditGridJsonParsers.parseLocation(JSONObject(res))
+        withContext(Dispatchers.IO) {
+            mobileDb.upsertLocation(saved)
+        }
+        return saved
     }
 
     suspend fun createSubLocation(subLocation: SubLocation): SubLocation {
-        if (isLocalFallbackSession()) {
-            return subLocation.copy(id = subLocation.id.ifBlank { "sub-${System.currentTimeMillis()}" })
-        }
         val payload = AuditGridJsonParsers.serializeSubLocation(subLocation)
         val res = requestJson("/api/sub-locations", "POST", payload)
-        return AuditGridJsonParsers.parseSubLocation(JSONObject(res))
+        val saved = AuditGridJsonParsers.parseSubLocation(JSONObject(res))
+        withContext(Dispatchers.IO) {
+            mobileDb.upsertSubLocation(saved)
+        }
+        return saved
     }
 
     suspend fun createShop(shop: Shop): Shop {
-        if (isLocalFallbackSession()) {
-            return shop.copy(id = shop.id.ifBlank { "shop-${System.currentTimeMillis()}" })
-        }
         val payload = AuditGridJsonParsers.serializeShop(shop)
         val res = requestJson("/api/shops", "POST", payload)
-        return AuditGridJsonParsers.parseShop(JSONObject(res))
+        val saved = AuditGridJsonParsers.parseShop(JSONObject(res))
+        withContext(Dispatchers.IO) {
+            mobileDb.upsertShop(saved)
+        }
+        return saved
     }
 
     suspend fun updatePlaceGps(
@@ -431,14 +486,6 @@ class AuditGridApiClient(context: Context) {
         lng: Double,
         accuracy: Double
     ): JSONObject {
-        if (isLocalFallbackSession()) {
-            return JSONObject().apply {
-                put("id", targetId)
-                put("lat", lat)
-                put("lng", lng)
-                put("gpsStatus", "GPS Verified")
-            }
-        }
         val payload = JSONObject().apply {
             put("targetType", targetType)
             put("targetId", targetId)
@@ -451,15 +498,14 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun fetchFormConfig(formId: String): FormConfigPayload {
-        if (isLocalFallbackSession()) {
-            return DefaultServerCatalog.formConfigs[formId] ?: FormConfigPayload(formId = formId)
-        }
         return try {
             val body = requestJson("/api/forms/$formId/config")
             AuditGridJsonParsers.parseFormConfig(JSONObject(body))
         } catch (e: ApiError) {
             if (e.isNetwork) {
-                DefaultServerCatalog.formConfigs[formId] ?: FormConfigPayload(formId = formId)
+                val uid = currentAuditorId()
+                val cached = if (uid.isNotBlank()) mobileDb.loadFormConfigsForUser(uid)[formId] else null
+                cached ?: FormConfigPayload(formId = formId)
             } else {
                 throw e
             }
@@ -467,11 +513,6 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun fetchDistributorReports(): List<DistributorProductAuditReport> {
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            val uid = DefaultServerCatalog.buildUser(savedUser).id
-            return loadCachedDistributorReports(uid)
-        }
         val body = requestJson("/api/reports/distributor")
         val arr = JSONArray(body)
         return (0 until arr.length()).mapNotNull { i ->
@@ -480,11 +521,6 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun fetchRetailReports(): List<RetailMarketShopAuditReport> {
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            val uid = DefaultServerCatalog.buildUser(savedUser).id
-            return loadCachedRetailReports(uid)
-        }
         val body = requestJson("/api/reports/retail")
         val arr = JSONArray(body)
         return (0 until arr.length()).mapNotNull { i ->
@@ -493,11 +529,6 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun fetchCustomSubmissions(): List<CustomAuditSubmission> {
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            val uid = DefaultServerCatalog.buildUser(savedUser).id
-            return loadCachedCustomSubmissions(uid)
-        }
         val body = requestJson("/api/submissions")
         val arr = JSONArray(body)
         return (0 until arr.length()).mapNotNull { i ->
@@ -554,43 +585,7 @@ class AuditGridApiClient(context: Context) {
         JSONObject(body).optString("id")
     }
 
-    private fun markLocalPlanItemDone(
-        planId: String?,
-        planItemId: String?,
-        reportKind: String,
-        reportId: String,
-        reportCode: String
-    ) {
-        if (planId.isNullOrBlank() || planItemId.isNullOrBlank()) return
-        val idx = localPlansList.indexOfFirst { it.id == planId }
-        if (idx < 0) return
-        val plan = localPlansList[idx]
-        val updatedItems = plan.items.map { item ->
-            if (item.id == planItemId) {
-                item.copy(
-                    status = "Done",
-                    doneAt = pk.auditgrid.audittest.util.currentTimePkt(),
-                    reportKind = reportKind,
-                    reportId = reportId,
-                    reportCode = reportCode
-                )
-            } else {
-                item
-            }
-        }
-        val allFinished = updatedItems.isNotEmpty() && updatedItems.all { it.status == "Done" || it.status == "Skipped" }
-        localPlansList[idx] = plan.copy(
-            status = if (allFinished) "Completed" else plan.status,
-            items = updatedItems
-        )
-    }
-
     suspend fun submitDistributorReport(report: DistributorProductAuditReport): DistributorProductAuditReport {
-        if (isLocalFallbackSession()) {
-            val saved = report.copy(reviewStatus = report.reviewStatus ?: "Submitted")
-            markLocalPlanItemDone(report.planId, report.planItemId, "distributor", saved.id, saved.reportCode)
-            return saved
-        }
         val photosArr = JSONArray()
         for (img in report.capturedImages) {
             val photoId = uploadPhotoDataUrl(img.url)
@@ -627,11 +622,6 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun submitRetailShopReport(report: RetailMarketShopAuditReport): RetailMarketShopAuditReport {
-        if (isLocalFallbackSession()) {
-            val saved = report.copy(reviewStatus = report.reviewStatus ?: "Submitted")
-            markLocalPlanItemDone(report.planId, report.planItemId, "retail", saved.id, saved.reportCode)
-            return saved
-        }
         val shopAuditsArr = JSONArray()
         for (sa in report.shopAudits) {
             val photosArr = JSONArray()
@@ -686,39 +676,6 @@ class AuditGridApiClient(context: Context) {
             if (v != null && v != "") {
                 stringAnswers[k] = v.toString()
             }
-        }
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            val userObj = DefaultServerCatalog.buildUser(savedUser)
-            val saved = (fallbackMeta ?: CustomAuditSubmission(
-                id = clientRequestId,
-                reportCode = pk.auditgrid.audittest.util.makeReportCode("SUB"),
-                formId = formId,
-                formTitle = DefaultServerCatalog.forms.find { it.id == formId }?.title ?: formId,
-                targetType = targetType,
-                targetId = targetId,
-                targetName = targetId,
-                auditorId = userObj.id,
-                auditorName = userObj.fullName,
-                submittedDate = pk.auditgrid.audittest.util.currentIsoDate(),
-                submittedTime = pk.auditgrid.audittest.util.currentTimePkt(),
-                submittedAtISO = pk.auditgrid.audittest.util.currentIsoTimestamp(),
-                mobileLat = mobileLat,
-                mobileLng = mobileLng,
-                mobileAccuracyMeters = mobileAccuracyMeters.toInt(),
-                locationMatched = true,
-                answers = stringAnswers,
-                capturedImages = photos,
-                reviewStatus = "Submitted",
-                planId = planLink?.planId,
-                planItemId = planLink?.itemId
-            )).copy(
-                answers = if (stringAnswers.isNotEmpty()) stringAnswers else (fallbackMeta?.answers ?: emptyMap()),
-                capturedImages = photos,
-                reviewStatus = "Submitted"
-            )
-            markLocalPlanItemDone(planLink?.planId, planLink?.itemId, "custom", saved.id, saved.reportCode)
-            return saved
         }
         val photosArr = JSONArray()
         for (img in photos) {
@@ -775,20 +732,23 @@ class AuditGridApiClient(context: Context) {
     }
 
     suspend fun fetchPlans(inProgressOnly: Boolean = false): List<AuditPlan> {
-        if (isLocalFallbackSession()) {
-            val all = localPlansList.toList()
-            return if (inProgressOnly) all.filter { it.status == "In Progress" } else all
-        }
+        val uid = currentAuditorId()
         return try {
             val path = if (inProgressOnly) "/api/plans?status=In%20Progress" else "/api/plans"
             val body = requestJson(path)
             val arr = JSONArray(body)
-            (0 until arr.length()).mapNotNull { i ->
+            val parsed = (0 until arr.length()).mapNotNull { i ->
                 arr.optJSONObject(i)?.let { AuditGridJsonParsers.parsePlan(it) }
             }
+            if (!inProgressOnly && uid.isNotBlank()) {
+                withContext(Dispatchers.IO) {
+                    mobileDb.savePlansForUser(uid, parsed)
+                }
+            }
+            parsed
         } catch (e: ApiError) {
-            if (e.isNetwork) {
-                val all = localPlansList.toList()
+            if (e.isNetwork && uid.isNotBlank()) {
+                val all = withContext(Dispatchers.IO) { mobileDb.loadPlansForUser(uid) }
                 if (inProgressOnly) all.filter { it.status == "In Progress" } else all
             } else {
                 throw e
@@ -802,30 +762,6 @@ class AuditGridApiClient(context: Context) {
         title: String?,
         items: List<PlanItem>
     ): AuditPlan {
-        if (isLocalFallbackSession()) {
-            val savedUser = prefs.getString(SESSION_USER_KEY, "auditor") ?: "auditor"
-            val userObj = DefaultServerCatalog.buildUser(savedUser)
-            val newPlan = AuditPlan(
-                id = clientRequestId.ifBlank { UUID.randomUUID().toString() },
-                auditorId = userObj.id,
-                auditorName = userObj.fullName,
-                planDate = planDate,
-                title = title?.trim()?.ifBlank { "Field Audit Plan ($planDate)" } ?: "Field Audit Plan ($planDate)",
-                notes = "",
-                status = "Planned",
-                startedAt = null,
-                items = items.mapIndexed { idx, i ->
-                    val formTitle = DefaultServerCatalog.forms.find { it.id == i.formId }?.title ?: i.formId
-                    i.copy(
-                        id = i.id.ifBlank { "pli-${System.currentTimeMillis()}-$idx" },
-                        formTitle = i.formTitle.ifBlank { formTitle },
-                        status = "Pending"
-                    )
-                }
-            )
-            localPlansList.add(0, newPlan)
-            return newPlan
-        }
         val itemsArr = JSONArray()
         for (i in items) {
             itemsArr.put(JSONObject().apply {
@@ -842,81 +778,72 @@ class AuditGridApiClient(context: Context) {
             put("items", itemsArr)
         }
         val res = requestJson("/api/plans", "POST", payload)
-        return AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val created = AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val uid = currentAuditorId()
+        if (uid.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val existing = mobileDb.loadPlansForUser(uid)
+                mobileDb.savePlansForUser(uid, listOf(created) + existing.filter { it.id != created.id })
+            }
+        }
+        return created
     }
 
     suspend fun startPlan(planId: String): AuditPlan {
-        if (isLocalFallbackSession()) {
-            val idx = localPlansList.indexOfFirst { it.id == planId }
-            if (idx >= 0) {
-                val updated = localPlansList[idx].copy(
-                    status = "In Progress",
-                    startedAt = pk.auditgrid.audittest.util.currentTimePkt()
-                )
-                localPlansList[idx] = updated
-                return updated
+        val res = requestJson("/api/plans/$planId/start", "POST", JSONObject())
+        val updated = AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val uid = currentAuditorId()
+        if (uid.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val existing = mobileDb.loadPlansForUser(uid)
+                mobileDb.savePlansForUser(uid, existing.map { if (it.id == planId) updated else it })
             }
         }
-        val res = requestJson("/api/plans/$planId/start", "POST", JSONObject())
-        return AuditGridJsonParsers.parsePlan(JSONObject(res))
+        return updated
     }
 
     suspend fun cancelPlan(planId: String): AuditPlan {
-        if (isLocalFallbackSession()) {
-            val idx = localPlansList.indexOfFirst { it.id == planId }
-            if (idx >= 0) {
-                val updated = localPlansList[idx].copy(status = "Cancelled")
-                localPlansList[idx] = updated
-                return updated
+        val res = requestJson("/api/plans/$planId/cancel", "POST", JSONObject())
+        val updated = AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val uid = currentAuditorId()
+        if (uid.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val existing = mobileDb.loadPlansForUser(uid)
+                mobileDb.savePlansForUser(uid, existing.map { if (it.id == planId) updated else it })
             }
         }
-        val res = requestJson("/api/plans/$planId/cancel", "POST", JSONObject())
-        return AuditGridJsonParsers.parsePlan(JSONObject(res))
+        return updated
     }
 
     suspend fun deletePlan(planId: String) {
-        if (isLocalFallbackSession()) {
-            localPlansList.removeAll { it.id == planId }
-            return
-        }
         requestJson("/api/plans/$planId", "DELETE")
+        val uid = currentAuditorId()
+        if (uid.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val existing = mobileDb.loadPlansForUser(uid)
+                mobileDb.savePlansForUser(uid, existing.filterNot { it.id == planId })
+            }
+        }
     }
 
     suspend fun skipPlanItem(planId: String, itemId: String, reason: String): AuditPlan {
-        if (isLocalFallbackSession()) {
-            val idx = localPlansList.indexOfFirst { it.id == planId }
-            if (idx >= 0) {
-                val plan = localPlansList[idx]
-                val updatedItems = plan.items.map { item ->
-                    if (item.id == itemId) {
-                        item.copy(
-                            status = "Skipped",
-                            doneAt = pk.auditgrid.audittest.util.currentTimePkt(),
-                            skipReason = reason.trim()
-                        )
-                    } else {
-                        item
-                    }
-                }
-                val allFinished = updatedItems.isNotEmpty() && updatedItems.all { it.status == "Done" || it.status == "Skipped" }
-                val updated = plan.copy(
-                    status = if (allFinished) "Completed" else plan.status,
-                    items = updatedItems
-                )
-                localPlansList[idx] = updated
-                return updated
-            }
-        }
         val payload = JSONObject().apply {
             put("status", "Skipped")
             put("reason", reason.trim())
         }
         val res = requestJson("/api/plans/$planId/items/$itemId", "PATCH", payload)
-        return AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val updated = AuditGridJsonParsers.parsePlan(JSONObject(res))
+        val uid = currentAuditorId()
+        if (uid.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val existing = mobileDb.loadPlansForUser(uid)
+                mobileDb.savePlansForUser(uid, existing.map { if (it.id == planId) updated else it })
+            }
+        }
+        return updated
     }
 
     suspend fun sendTrackingPing(lat: Double, lng: Double, accuracy: Double) {
-        if (isLocalFallbackSession()) return
         val payload = JSONObject().apply {
             put("lat", lat)
             put("lng", lng)
@@ -936,160 +863,75 @@ class AuditGridApiClient(context: Context) {
         prefs.edit().remove(key).apply()
     }
 
-    // Offline Outbox Queue & Read-Only Completed Audits Cache
-    fun loadOutboxItems(auditorId: String): List<PendingOutboxItem> {
-        val raw = prefs.getString("ag.outbox.$auditorId", null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { AuditGridJsonParsers.parsePendingOutboxItem(it) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    // Offline Outbox Queue & Read-Only Completed Audits in Mobile SQLite Database
+    fun loadOutboxItems(auditorId: String): List<PendingOutboxItem> =
+        mobileDb.loadReportItemsForUser(auditorId, "outbox", AuditGridJsonParsers::parsePendingOutboxItem)
 
     fun saveOutboxItems(auditorId: String, items: List<PendingOutboxItem>) {
-        try {
-            val arr = JSONArray()
-            items.forEach { arr.put(AuditGridJsonParsers.serializePendingOutboxItem(it)) }
-            prefs.edit().putString("ag.outbox.$auditorId", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
+        mobileDb.saveReportItemsForUser(
+            auditorId,
+            "outbox",
+            items.map { it.id to AuditGridJsonParsers.serializePendingOutboxItem(it) }
+        )
     }
 
-    fun loadCachedDistributorReports(auditorId: String): List<DistributorProductAuditReport> {
-        val raw = prefs.getString("ag.completed.dist.$auditorId", null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { AuditGridJsonParsers.parseDistributorReport(it) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    fun loadCachedDistributorReports(auditorId: String): List<DistributorProductAuditReport> =
+        mobileDb.loadReportItemsForUser(auditorId, "distributor", AuditGridJsonParsers::parseDistributorReport)
 
     fun saveCachedDistributorReports(auditorId: String, items: List<DistributorProductAuditReport>) {
-        try {
-            val arr = JSONArray()
-            items.take(100).forEach { arr.put(AuditGridJsonParsers.serializeDistributorReport(it)) }
-            prefs.edit().putString("ag.completed.dist.$auditorId", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
+        mobileDb.saveReportItemsForUser(
+            auditorId,
+            "distributor",
+            items.take(100).map { it.id to AuditGridJsonParsers.serializeDistributorReport(it) }
+        )
     }
 
-    fun loadCachedRetailReports(auditorId: String): List<RetailMarketShopAuditReport> {
-        val raw = prefs.getString("ag.completed.retail.$auditorId", null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { AuditGridJsonParsers.parseRetailReport(it) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    fun loadCachedRetailReports(auditorId: String): List<RetailMarketShopAuditReport> =
+        mobileDb.loadReportItemsForUser(auditorId, "retail", AuditGridJsonParsers::parseRetailReport)
 
     fun saveCachedRetailReports(auditorId: String, items: List<RetailMarketShopAuditReport>) {
-        try {
-            val arr = JSONArray()
-            items.take(100).forEach { arr.put(AuditGridJsonParsers.serializeRetailReport(it)) }
-            prefs.edit().putString("ag.completed.retail.$auditorId", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
+        mobileDb.saveReportItemsForUser(
+            auditorId,
+            "retail",
+            items.take(100).map { it.id to AuditGridJsonParsers.serializeRetailReport(it) }
+        )
     }
 
-    fun loadCachedCustomSubmissions(auditorId: String): List<CustomAuditSubmission> {
-        val raw = prefs.getString("ag.completed.custom.$auditorId", null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { AuditGridJsonParsers.parseCustomSubmission(it) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    fun loadCachedCustomSubmissions(auditorId: String): List<CustomAuditSubmission> =
+        mobileDb.loadReportItemsForUser(auditorId, "custom", AuditGridJsonParsers::parseCustomSubmission)
 
     fun saveCachedCustomSubmissions(auditorId: String, items: List<CustomAuditSubmission>) {
-        try {
-            val arr = JSONArray()
-            items.take(100).forEach { arr.put(AuditGridJsonParsers.serializeCustomSubmission(it)) }
-            prefs.edit().putString("ag.completed.custom.$auditorId", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
+        mobileDb.saveReportItemsForUser(
+            auditorId,
+            "custom",
+            items.take(100).map { it.id to AuditGridJsonParsers.serializeCustomSubmission(it) }
+        )
     }
 
-    // On-device persistence for Synced Audit Forms, Field Configs & Master Data (Offline & Online Use)
+    // On-device SQLite persistence for Synced Audit Forms, Field Configs & Master Data
     fun hasSyncedFormsOnce(auditorId: String): Boolean =
-        prefs.getBoolean("ag.forms.synced.$auditorId", false)
+        mobileDb.hasSyncedFormsOnce(auditorId)
 
     fun setFormsSyncedOnce(auditorId: String, synced: Boolean) {
-        prefs.edit().putBoolean("ag.forms.synced.$auditorId", synced).apply()
+        mobileDb.setFormsSyncedOnce(auditorId, synced)
     }
 
-    fun loadCachedForms(auditorId: String): List<AuditFormDefinition> {
-        val raw = prefs.getString("ag.forms.list.$auditorId", null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { AuditGridJsonParsers.parseFormDefinition(it) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    fun loadCachedForms(auditorId: String): List<AuditFormDefinition> =
+        mobileDb.loadFormsForUser(auditorId)
 
     fun saveCachedForms(auditorId: String, forms: List<AuditFormDefinition>) {
-        try {
-            val arr = JSONArray()
-            forms.forEach { arr.put(AuditGridJsonParsers.serializeFormDefinition(it)) }
-            prefs.edit().putString("ag.forms.list.$auditorId", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
+        val configs = mobileDb.loadFormConfigsForUser(auditorId)
+        mobileDb.saveServerFormsForUser(auditorId, forms, configs)
     }
 
-    fun loadCachedFormConfigs(auditorId: String): FormConfigMap {
-        val raw = prefs.getString("ag.forms.configs.$auditorId", null) ?: return emptyMap()
-        return try {
-            val obj = JSONObject(raw)
-            val out = mutableMapOf<String, FormConfigPayload>()
-            val keys = obj.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                obj.optJSONObject(k)?.let { out[k] = AuditGridJsonParsers.parseFormConfig(it) }
-            }
-            out
-        } catch (_: Exception) {
-            emptyMap()
-        }
-    }
+    fun loadCachedFormConfigs(auditorId: String): FormConfigMap =
+        mobileDb.loadFormConfigsForUser(auditorId)
 
     fun saveCachedFormConfigs(auditorId: String, configs: FormConfigMap) {
-        try {
-            val obj = JSONObject()
-            configs.forEach { (id, cfg) ->
-                obj.put(id, AuditGridJsonParsers.serializeFormConfig(cfg))
-            }
-            prefs.edit().putString("ag.forms.configs.$auditorId", obj.toString()).apply()
-        } catch (_: Exception) {
-        }
+        val forms = mobileDb.loadFormsForUser(auditorId)
+        mobileDb.saveServerFormsForUser(auditorId, forms, configs)
     }
 
-    fun saveRawBootstrapCache(auditorId: String, rawJson: String) {
-        try {
-            prefs.edit().putString("ag.bootstrap.raw.$auditorId", rawJson).apply()
-        } catch (_: Exception) {
-        }
-    }
-
-    fun loadCachedBootstrap(auditorId: String, session: Session): BootstrapPayload? {
-        val raw = prefs.getString("ag.bootstrap.raw.$auditorId", null) ?: return null
-        return try {
-            AuditGridJsonParsers.parseBootstrap(JSONObject(raw), session)
-        } catch (_: Exception) {
-            null
-        }
-    }
+    fun loadCachedBootstrap(auditorId: String, session: Session): BootstrapPayload? =
+        mobileDb.loadBootstrapForUser(session)
 }

@@ -32,6 +32,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -83,20 +84,86 @@ fun DistributorAuditFormScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val distDraftKey = "auditgrid_dist_product_audit_draft_v1_${activeAuditor.id}"
+    val locationStatus by rememberMobileLocationStatus(context)
 
     var openedFormId by remember {
         mutableStateOf<String?>(
             when {
+                !isMobileLocationReadyForAudit(context) -> null
                 !initialFormId.isNullOrBlank() -> initialFormId
                 auditForms.any { it.id == RETAIL_FORM_ID } && hasSavedRetailDraft(apiClient, activeAuditor.id) -> RETAIL_FORM_ID
                 else -> null
             }
         )
     }
+    var pendingFormIdToOpen by remember {
+        mutableStateOf<String?>(
+            if (!isMobileLocationReadyForAudit(context) && !initialFormId.isNullOrBlank()) initialFormId else null
+        )
+    }
+    var showLocationRequiredDialog by remember {
+        mutableStateOf(!isMobileLocationReadyForAudit(context) && !initialFormId.isNullOrBlank())
+    }
+
+    val gatePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val granted = grants[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            grants[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (granted) {
+            if (isDeviceLocationEnabled(context)) {
+                showLocationRequiredDialog = false
+                pendingFormIdToOpen?.let { targetFormId ->
+                    pendingFormIdToOpen = null
+                    openedFormId = targetFormId
+                }
+            } else {
+                showLocationRequiredDialog = true
+                onToast("Mobile location is OFF. Turn on mobile location to start an audit.")
+            }
+        } else {
+            showLocationRequiredDialog = true
+            onToast("Location permission is required to open any audit form.")
+        }
+    }
+
+    fun tryOpenAuditForm(formId: String) {
+        val status = getMobileLocationStatus(context)
+        if (status.isReady) {
+            showLocationRequiredDialog = false
+            pendingFormIdToOpen = null
+            openedFormId = formId
+        } else {
+            pendingFormIdToOpen = formId
+            openedFormId = null
+            showLocationRequiredDialog = true
+            if (!status.hasPermission) {
+                onToast("Location permission is off. Allow location to open any audit form.")
+            } else {
+                onToast("Mobile location is OFF. Turn on mobile location to start an audit.")
+            }
+        }
+    }
 
     LaunchedEffect(initialFormId) {
         if (!initialFormId.isNullOrBlank()) {
-            openedFormId = initialFormId
+            tryOpenAuditForm(initialFormId)
+        }
+    }
+
+    // If mobile location is turned OFF while any audit form is open, immediately close the form and block audit
+    LaunchedEffect(locationStatus.isReady, openedFormId) {
+        if (openedFormId != null && !locationStatus.isReady) {
+            pendingFormIdToOpen = openedFormId
+            openedFormId = null
+            showLocationRequiredDialog = true
+            onToast("Mobile location is OFF. Turn on mobile location to open or continue an audit.")
+        } else if (locationStatus.isReady && showLocationRequiredDialog) {
+            showLocationRequiredDialog = false
+            pendingFormIdToOpen?.let { targetFormId ->
+                pendingFormIdToOpen = null
+                openedFormId = targetFormId
+            }
         }
     }
 
@@ -104,8 +171,41 @@ fun DistributorAuditFormScreen(
         if (onExit != null) onExit() else openedFormId = null
     }
 
-    val assignedTerritoryIdsSet = remember(activeAuditor.id) {
-        activeAuditor.assignedTerritoryIds.toSet()
+    if (showLocationRequiredDialog) {
+        MobileLocationRequiredDialog(
+            status = locationStatus,
+            onTurnOnLocation = { openDeviceLocationSettings(context) },
+            onGrantPermission = {
+                gatePermissionLauncher.launch(
+                    arrayOf(
+                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                        android.Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            },
+            onCheckAgain = {
+                val fresh = getMobileLocationStatus(context)
+                if (fresh.isReady) {
+                    showLocationRequiredDialog = false
+                    pendingFormIdToOpen?.let { targetFormId ->
+                        pendingFormIdToOpen = null
+                        openedFormId = targetFormId
+                    }
+                } else {
+                    onToast("Mobile location is still OFF. Please turn on mobile location first.")
+                }
+            },
+            onDismiss = {
+                showLocationRequiredDialog = false
+                if (!initialFormId.isNullOrBlank() && openedFormId == null) {
+                    onExit?.invoke()
+                }
+            }
+        )
+    }
+
+    val assignedTerritoryIdsSet = remember(activeAuditor, territories) {
+        activeAuditor.linkedTerritoryIds(territories)
     }
     val scopedDistributors = remember(distributors, assignedTerritoryIdsSet) {
         distributors.filter { it.status == "Active" && assignedTerritoryIdsSet.contains(it.territoryId) }
@@ -117,6 +217,9 @@ fun DistributorAuditFormScreen(
         subLocations.filter { it.status != "Inactive" && assignedTerritoryIdsSet.contains(it.territoryId) }
     }
 
+    var showManualPackageDialog by remember { mutableStateOf(false) }
+    var manualPackageJsonText by remember { mutableStateOf("") }
+
     val importPackageLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri ->
@@ -125,6 +228,8 @@ fun DistributorAuditFormScreen(
                 try {
                     val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                     if (!raw.isNullOrBlank()) {
+                        showManualPackageDialog = false
+                        manualPackageJsonText = ""
                         onImportFormPackageJson(raw)
                     } else {
                         onToast("Selected Form Package file is empty.")
@@ -136,8 +241,105 @@ fun DistributorAuditFormScreen(
         }
     }
 
-    // VIEW 1: AUDIT FORMS LIST
-    val currentOpenedId = openedFormId
+    if (showManualPackageDialog && onImportFormPackageJson != null) {
+        Dialog(onDismissRequest = { showManualPackageDialog = false }) {
+            Surface(
+                color = AgCardWhite,
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, AgSoftBlueBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Add Form via Package Manually",
+                            color = AgPrimary,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(
+                            onClick = { showManualPackageDialog = false },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Close", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    Text(
+                        text = "Select a Form Package (.json) file from your phone or paste the Form Package JSON below to save the form directly into your mobile database.",
+                        color = AgMutedText,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    )
+                    Button(
+                        onClick = { importPackageLauncher.launch("*/*") },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AgActionBlue),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 44.dp)
+                            .testTag("dialog_pick_package_file_button")
+                    ) {
+                        Icon(Icons.Default.FileOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Select .json Package File from Phone", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedTextField(
+                        value = manualPackageJsonText,
+                        onValueChange = { manualPackageJsonText = it },
+                        label = { Text("Or paste Form Package JSON here") },
+                        placeholder = { Text("{\"forms\": [...], \"formConfigs\": {...}}") },
+                        minLines = 4,
+                        maxLines = 8,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dialog_paste_package_json_input")
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { showManualPackageDialog = false },
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Cancel")
+                        }
+                        Button(
+                            onClick = {
+                                val raw = manualPackageJsonText.trim()
+                                if (raw.isBlank()) {
+                                    onToast("Paste Form Package JSON or select a .json file.")
+                                    return@Button
+                                }
+                                onImportFormPackageJson(raw)
+                                showManualPackageDialog = false
+                                manualPackageJsonText = ""
+                            },
+                            enabled = manualPackageJsonText.isNotBlank(),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AgRoyalBlue),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("dialog_import_pasted_package_button")
+                        ) {
+                            Text("Save Form Package", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // VIEW 1: AUDIT FORMS LIST (Any audit form is strictly blocked from opening while mobile location is OFF)
+    val currentOpenedId = openedFormId?.takeIf { locationStatus.isReady && isMobileLocationReadyForAudit(context) }
     if (currentOpenedId == null) {
         val activeForms = remember(auditForms) {
             auditForms.filter { it.status == "Active" }
@@ -180,7 +382,7 @@ fun DistributorAuditFormScreen(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier
                                 .heightIn(min = 36.dp)
-                                .clickable { importPackageLauncher.launch("application/json") }
+                                .clickable { showManualPackageDialog = true }
                                 .testTag("header_import_forms_package_button")
                         ) {
                             Row(
@@ -249,6 +451,20 @@ fun DistributorAuditFormScreen(
                     }
                 }
             }
+
+            // Prominent Mobile Location OFF Banner when location is disabled
+            MobileLocationOffBanner(
+                status = locationStatus,
+                onTurnOnLocation = { openDeviceLocationSettings(context) },
+                onGrantPermission = {
+                    gatePermissionLauncher.launch(
+                        arrayOf(
+                            android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            android.Manifest.permission.ACCESS_COARSE_LOCATION
+                        )
+                    )
+                }
+            )
 
             // Empty-APK State: When no forms are in the mobile app yet
             if (activeForms.isEmpty()) {
@@ -332,7 +548,7 @@ fun DistributorAuditFormScreen(
                         }
                         if (onImportFormPackageJson != null) {
                             OutlinedButton(
-                                onClick = { importPackageLauncher.launch("application/json") },
+                                onClick = { showManualPackageDialog = true },
                                 shape = RoundedCornerShape(10.dp),
                                 border = BorderStroke(1.5.dp, AgRoyalBlue),
                                 modifier = Modifier
@@ -348,7 +564,7 @@ fun DistributorAuditFormScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "Import Form Package (.json)",
+                                    text = "Add Form via Package Manually (.json)",
                                     color = AgRoyalBlue,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Bold
@@ -384,11 +600,17 @@ fun DistributorAuditFormScreen(
                             shape = RoundedCornerShape(16.dp),
                             border = BorderStroke(
                                 width = if (isNewlyInserted) 1.5.dp else 1.dp,
-                                color = if (isNewlyInserted) AgAccentGreen else AgSoftBlueBorder
+                                color = if (!locationStatus.isReady) {
+                                    AgDestructive.copy(alpha = 0.45f)
+                                } else if (isNewlyInserted) {
+                                    AgAccentGreen
+                                } else {
+                                    AgSoftBlueBorder
+                                }
                             ),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { openedFormId = form.id }
+                                .clickable { tryOpenAuditForm(form.id) }
                                 .testTag("open_form_${form.id}")
                         ) {
                             Column(
@@ -437,7 +659,31 @@ fun DistributorAuditFormScreen(
                                             }
                                         }
                                     }
-                                    if (savedDraftExists) {
+                                    if (!locationStatus.isReady) {
+                                        Surface(
+                                            color = AgDestructiveBg,
+                                            shape = RoundedCornerShape(999.dp)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.LocationOff,
+                                                    contentDescription = null,
+                                                    tint = AgDestructive,
+                                                    modifier = Modifier.size(12.dp)
+                                                )
+                                                Text(
+                                                    text = "Location OFF",
+                                                    color = AgDestructiveDark,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+                                    } else if (savedDraftExists) {
                                         Surface(
                                             color = AgWarningBg,
                                             shape = RoundedCornerShape(999.dp)
@@ -521,6 +767,31 @@ fun DistributorAuditFormScreen(
                                     )
                                 }
                             }
+                        }
+                    }
+                    if (onImportFormPackageJson != null) {
+                        OutlinedButton(
+                            onClick = { showManualPackageDialog = true },
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.5.dp, AgRoyalBlue),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 46.dp)
+                                .testTag("list_add_form_package_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.FileOpen,
+                                contentDescription = null,
+                                tint = AgRoyalBlue,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Add Form via Package Manually (.json)",
+                                color = AgRoyalBlue,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
